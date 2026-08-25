@@ -29,7 +29,7 @@ module.exports = [
           p.connection.subscribe(p.player);
         }
         let url=query;
-        if(!/^https?:\\/\\//i.test(query)) {
+        if(!/^https?:\/\//i.test(query)) {
           const res=await play.search(query,{limit:1});
           if(!res.length) return i.reply({content:"❌ No result found.",ephemeral:true});
           url=res[0].url;
