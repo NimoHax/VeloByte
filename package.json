@@ -1,0 +1,22 @@
+{
+  "name": "velobyte-core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VeloByte Discord community, moderation, support, development and music manager.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node scripts/register-commands.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.0",
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1",
+    "ffmpeg-static": "^5.2.0",
+    "pg": "^8.16.3",
+    "play-dl": "^1.9.7"
+  }
+}
