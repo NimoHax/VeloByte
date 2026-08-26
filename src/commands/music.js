@@ -730,7 +730,8 @@ function playTrack(
 
         "--no-part",
 
-        "--stdout",
+        "-o",
+        "-",
 
         "--quiet",
 
