@@ -6,13 +6,15 @@ RUN apt-get update \
        ca-certificates \
        python3 \
        python3-pip \
-    && pip3 install --break-system-packages --no-cache-dir -U yt-dlp \
+       curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install latest yt-dlp with EJS support
+RUN python3 -m pip install --break-system-packages -U "yt-dlp[default]"
 
 WORKDIR /app
 
 COPY package*.json ./
-
 RUN npm install --omit=dev
 
 COPY . .
