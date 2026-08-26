@@ -765,54 +765,52 @@ function playTrack(
       // It only converts the container to OGG/Opus.
       // ==================================================
 
-      const ffmpeg =
-         spawn(
-           "ffmpeg",
-           [
-             "-hide_banner",
+const ffmpeg = spawn(
+  "ffmpeg",
+  [
+    "-hide_banner",
+    "-loglevel",
+    "error",
 
-             "-loglevel",
-             "error",
+    "-i",
+    "pipe:0",
 
-             "-i",
-             "pipe:0",
+    "-vn",
 
-             "-vn",
+    "-c:a",
+    "libopus",
 
-             "-c:a",
-             "libopus",
+    "-b:a",
+    "192k",
 
-             "-b:a",
-             "192k",
- 
-             "-vbr",
-             "on",
+    "-vbr",
+    "on",
 
-             "-compression_level",
-             "10",
+    "-compression_level",
+    "10",
 
-             "-application",
-             "audio",
- 
-             "-ar",
-             "48000",
+    "-application",
+    "audio",
 
-             "-ac",
-             "2",
+    "-ar",
+    "48000",
 
-             "-f",
-             "ogg",
+    "-ac",
+    "2",
 
-             "pipe:1",
-           ],
-          {
-            stdio: [
-              "pipe",
-              "pipe",
-              "pipe",
-            ],
-          }
-        );
+    "-f",
+    "ogg",
+
+    "pipe:1",
+  ],
+  {
+    stdio: [
+      "pipe",
+      "pipe",
+      "pipe",
+    ],
+  }
+);
 
       data.ffmpegProcess =
         ffmpeg;
