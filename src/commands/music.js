@@ -1,8 +1,10 @@
-// src/commands/music.js
+// =========================================================
+// VELOBYTE MUSIC
+// =========================================================
 
 const {
   SlashCommandBuilder,
-  EmbedBuilder
+  EmbedBuilder,
 } = require("discord.js");
 
 const {
@@ -12,30 +14,746 @@ const {
   AudioPlayerStatus,
   NoSubscriberBehavior,
   StreamType,
-  VoiceConnectionStatus
+  VoiceConnectionStatus,
+  entersState,
 } = require("@discordjs/voice");
 
 const { spawn } = require("child_process");
 
+// =========================================================
+// PLAYER STORAGE
+// =========================================================
+
 const players = new Map();
 
-module.exports = {
-  data: new SlashCommandBuilder()
-    .setName("play")
-    .setDescription("Play a song from YouTube")
-    .addStringOption(option =>
-      option
-        .setName("query")
-        .setDescription("Song name or YouTube URL")
-        .setRequired(true)
-    ),
+// =========================================================
+// YT-DLP COMMON ARGS
+// =========================================================
 
-  async execute(interaction) {
+const YTDLP_ARGS = [
+  "--js-runtimes",
+  "node",
+
+  "--remote-components",
+  "ejs:github",
+
+  "--no-warnings",
+];
+
+// =========================================================
+// GET / CREATE GUILD PLAYER
+// =========================================================
+
+function getGuildPlayer(guildId) {
+  let data = players.get(guildId);
+
+  if (!data) {
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+    });
+
+    data = {
+      player,
+      connection: null,
+
+      currentProcess: null,
+
+      queue: [],
+      current: null,
+
+      playing: false,
+      paused: false,
+      stopping: false,
+
+      textChannel: null,
+    };
+
+    players.set(guildId, data);
+
+    // ---------------------------------------------
+    // PLAYER ERROR
+    // ---------------------------------------------
+
+    player.on("error", (error) => {
+      console.error(
+        "[Music] Audio Player Error:",
+        error
+      );
+
+      cleanupGuild(guildId);
+    });
+
+    // ---------------------------------------------
+    // PLAYER IDLE
+    // ---------------------------------------------
+
+    player.on(
+      AudioPlayerStatus.Idle,
+      async () => {
+        const currentData = players.get(guildId);
+
+        if (!currentData) {
+          return;
+        }
+
+        if (currentData.stopping) {
+          return;
+        }
+
+        console.log(
+          "[Music] Current track finished."
+        );
+
+        // Stop old yt-dlp
+        if (currentData.currentProcess) {
+          try {
+            currentData.currentProcess.kill("SIGKILL");
+          } catch {}
+
+          currentData.currentProcess = null;
+        }
+
+        currentData.current = null;
+        currentData.playing = false;
+        currentData.paused = false;
+
+        // Play next song
+        if (currentData.queue.length > 0) {
+          try {
+            await playNext(guildId);
+          } catch (error) {
+            console.error(
+              "[Music] Failed to play next track:",
+              error
+            );
+          }
+        }
+      }
+    );
+  }
+
+  return data;
+}
+
+// =========================================================
+// CLEANUP GUILD
+// =========================================================
+
+function cleanupGuild(guildId) {
+  const data = players.get(guildId);
+
+  if (!data) {
+    return;
+  }
+
+  data.stopping = true;
+
+  // Stop yt-dlp
+  if (data.currentProcess) {
+    try {
+      data.currentProcess.kill("SIGKILL");
+    } catch {}
+
+    data.currentProcess = null;
+  }
+
+  // Stop player
+  try {
+    data.player.stop(true);
+  } catch {}
+
+  // Disconnect voice
+  try {
+    if (data.connection) {
+      data.connection.destroy();
+    }
+  } catch {}
+
+  data.queue = [];
+  data.current = null;
+
+  data.playing = false;
+  data.paused = false;
+
+  players.delete(guildId);
+
+  console.log(
+    `[Music] Cleaned up guild: ${guildId}`
+  );
+}
+
+// =========================================================
+// GET YOUTUBE INFORMATION
+// =========================================================
+
+function getYoutubeInfo(query) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      ...YTDLP_ARGS,
+
+      "--dump-single-json",
+      "--no-playlist",
+      "--skip-download",
+      "--quiet",
+
+      query,
+    ];
+
+    console.log(
+      `[Music] Searching YouTube: ${query}`
+    );
+
+    const process = spawn(
+      "yt-dlp",
+      args,
+      {
+        stdio: [
+          "ignore",
+          "pipe",
+          "pipe",
+        ],
+      }
+    );
+
+    let output = "";
+    let errorOutput = "";
+
+    // ---------------------------------------------
+    // STDOUT
+    // ---------------------------------------------
+
+    process.stdout.on("data", (data) => {
+      output += data.toString();
+    });
+
+    // ---------------------------------------------
+    // STDERR
+    // ---------------------------------------------
+
+    process.stderr.on("data", (data) => {
+      errorOutput += data.toString();
+    });
+
+    // ---------------------------------------------
+    // PROCESS ERROR
+    // ---------------------------------------------
+
+    process.on("error", (error) => {
+      reject(error);
+    });
+
+    // ---------------------------------------------
+    // PROCESS CLOSE
+    // ---------------------------------------------
+
+    process.on("close", (code) => {
+      if (code !== 0) {
+        console.error(
+          "[yt-dlp info error]",
+          errorOutput
+        );
+
+        return reject(
+          new Error("YT_DLP_FAILED")
+        );
+      }
+
+      if (!output.trim()) {
+        return reject(
+          new Error("NO_OUTPUT")
+        );
+      }
+
+      try {
+        const info = JSON.parse(output);
+
+        resolve(info);
+      } catch (error) {
+        console.error(
+          "[Music] JSON parse error:",
+          error
+        );
+
+        console.error(
+          "[Music] yt-dlp output:",
+          output
+        );
+
+        reject(error);
+      }
+    });
+  });
+}
+
+// =========================================================
+// RESOLVE TRACK
+// =========================================================
+
+async function resolveTrack(query) {
+  const cleanQuery = query.trim();
+
+  if (!cleanQuery) {
+    throw new Error("EMPTY_QUERY");
+  }
+
+  let searchQuery;
+
+  // ---------------------------------------------
+  // DIRECT YOUTUBE URL
+  // ---------------------------------------------
+
+  if (
+    /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(
+      cleanQuery
+    )
+  ) {
+    searchQuery = cleanQuery;
+  } else {
+    // ---------------------------------------------
+    // YOUTUBE SEARCH
+    // ---------------------------------------------
+
+    searchQuery =
+      `ytsearch1:${cleanQuery}`;
+  }
+
+  const info =
+    await getYoutubeInfo(searchQuery);
+
+  if (!info) {
+    throw new Error("NO_RESULT");
+  }
+
+  let video = info;
+
+  // ytsearch returns entries[]
+  if (Array.isArray(info.entries)) {
+    video = info.entries.find(
+      (entry) =>
+        entry &&
+        entry.webpage_url
+    );
+  }
+
+  if (
+    !video ||
+    !video.webpage_url
+  ) {
+    throw new Error("NO_RESULT");
+  }
+
+  return {
+    title:
+      video.title ||
+      "Unknown Song",
+
+    url:
+      video.webpage_url,
+
+    duration:
+      video.duration_string ||
+      "Unknown",
+
+    thumbnail:
+      video.thumbnail ||
+      (
+        Array.isArray(video.thumbnails) &&
+        video.thumbnails.length
+          ? video.thumbnails[
+              video.thumbnails.length - 1
+            ].url
+          : null
+      ),
+  };
+}
+
+// =========================================================
+// CONNECT TO VOICE
+// =========================================================
+
+async function connectToVoice(
+  interaction,
+  data
+) {
+  const voiceChannel =
+    interaction.member.voice.channel;
+
+  if (!voiceChannel) {
+    throw new Error(
+      "NOT_IN_VOICE"
+    );
+  }
+
+  // Already connected
+  if (data.connection) {
+    const currentChannelId =
+      data.connection.joinConfig.channelId;
+
+    // Different voice channel
+    if (
+      currentChannelId !==
+      voiceChannel.id
+    ) {
+      throw new Error(
+        "DIFFERENT_VOICE"
+      );
+    }
+
+    return data.connection;
+  }
+
+  // ---------------------------------------------
+  // JOIN VOICE
+  // ---------------------------------------------
+
+  data.connection =
+    joinVoiceChannel({
+      channelId:
+        voiceChannel.id,
+
+      guildId:
+        interaction.guild.id,
+
+      adapterCreator:
+        interaction.guild
+          .voiceAdapterCreator,
+
+      selfDeaf: true,
+      selfMute: false,
+    });
+
+  // ---------------------------------------------
+  // WAIT UNTIL READY
+  // ---------------------------------------------
+
+  await entersState(
+    data.connection,
+    VoiceConnectionStatus.Ready,
+    20000
+  );
+
+  // Subscribe player
+  data.connection.subscribe(
+    data.player
+  );
+
+  console.log(
+    `[Music] Connected to ${voiceChannel.name}`
+  );
+
+  return data.connection;
+}
+
+// =========================================================
+// PLAY TRACK
+// =========================================================
+
+async function playTrack(
+  guildId,
+  track
+) {
+  const data =
+    players.get(guildId);
+
+  if (!data) {
+    throw new Error(
+      "PLAYER_NOT_FOUND"
+    );
+  }
+
+  if (!data.connection) {
+    throw new Error(
+      "VOICE_NOT_CONNECTED"
+    );
+  }
+
+  data.stopping = false;
+
+  // ---------------------------------------------
+  // STOP OLD YT-DLP
+  // ---------------------------------------------
+
+  if (data.currentProcess) {
+    try {
+      data.currentProcess.kill(
+        "SIGKILL"
+      );
+    } catch {}
+
+    data.currentProcess = null;
+  }
+
+  // ---------------------------------------------
+  // CURRENT TRACK
+  // ---------------------------------------------
+
+  data.current = track;
+  data.playing = true;
+  data.paused = false;
+
+  // ---------------------------------------------
+  // START YT-DLP
+  // ---------------------------------------------
+
+  const ytdlp = spawn(
+    "yt-dlp",
+    [
+      ...YTDLP_ARGS,
+
+      "--no-playlist",
+
+      /*
+       * Prefer WebM Opus because Discord
+       * can consume Opus directly.
+       */
+      "-f",
+      "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio",
+
+      "-o",
+      "-",
+
+      "--quiet",
+
+      track.url,
+    ],
+    {
+      stdio: [
+        "ignore",
+        "pipe",
+        "pipe",
+      ],
+    }
+  );
+
+  data.currentProcess =
+    ytdlp;
+
+  let ytdlpError = "";
+
+  // ---------------------------------------------
+  // YT-DLP STDERR
+  // ---------------------------------------------
+
+  ytdlp.stderr.on(
+    "data",
+    (chunk) => {
+      const message =
+        chunk.toString().trim();
+
+      if (message) {
+        ytdlpError +=
+          message + "\n";
+
+        console.log(
+          `[yt-dlp] ${message}`
+        );
+      }
+    }
+  );
+
+  // ---------------------------------------------
+  // YT-DLP ERROR
+  // ---------------------------------------------
+
+  ytdlp.on(
+    "error",
+    (error) => {
+      console.error(
+        "[Music] yt-dlp process error:",
+        error
+      );
+
+      if (
+        data.currentProcess ===
+        ytdlp
+      ) {
+        data.currentProcess =
+          null;
+      }
+
+      data.playing = false;
+      data.paused = false;
+    }
+  );
+
+  // ---------------------------------------------
+  // YT-DLP CLOSE
+  // ---------------------------------------------
+
+  ytdlp.on(
+    "close",
+    (code) => {
+      console.log(
+        `[yt-dlp] Process exited with code ${code}`
+      );
+
+      if (
+        code !== 0 &&
+        ytdlpError
+      ) {
+        console.error(
+          "[yt-dlp] Error:",
+          ytdlpError
+        );
+      }
+
+      if (
+        data.currentProcess ===
+        ytdlp
+      ) {
+        data.currentProcess =
+          null;
+      }
+    }
+  );
+
+  // ---------------------------------------------
+  // AUDIO RESOURCE
+  // ---------------------------------------------
+
+  const resource =
+    createAudioResource(
+      ytdlp.stdout,
+      {
+        inputType:
+          StreamType.WebmOpus,
+
+        inlineVolume: true,
+      }
+    );
+
+  if (resource.volume) {
+    resource.volume.setVolume(
+      1.0
+    );
+  }
+
+  // ---------------------------------------------
+  // PLAY
+  // ---------------------------------------------
+
+  data.player.play(
+    resource
+  );
+
+  console.log(
+    `▶️ Playing: ${track.title}`
+  );
+
+  return track;
+}
+
+// =========================================================
+// PLAY NEXT
+// =========================================================
+
+async function playNext(
+  guildId
+) {
+  const data =
+    players.get(guildId);
+
+  if (
+    !data ||
+    data.stopping
+  ) {
+    return false;
+  }
+
+  // Queue empty
+  if (
+    data.queue.length === 0
+  ) {
+    data.current = null;
+    data.playing = false;
+    data.paused = false;
+
+    return false;
+  }
+
+  const nextTrack =
+    data.queue.shift();
+
+  try {
+    await playTrack(
+      guildId,
+      nextTrack
+    );
+
+    if (data.textChannel) {
+      try {
+        await data.textChannel.send(
+          `🎵 Now playing: **${nextTrack.title}**`
+        );
+      } catch {}
+    }
+
+    return true;
+  } catch (error) {
+    console.error(
+      "[Music] Next track failed:",
+      error
+    );
+
+    data.current = null;
+    data.playing = false;
+    data.paused = false;
+
+    if (
+      data.queue.length > 0
+    ) {
+      return playNext(
+        guildId
+      );
+    }
+
+    return false;
+  }
+}
+
+// =========================================================
+// /PLAY
+// =========================================================
+
+const playCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("play")
+      .setDescription(
+        "Play a song from YouTube"
+      )
+      .addStringOption(
+        (option) =>
+          option
+            .setName("query")
+            .setDescription(
+              "Song name or YouTube URL"
+            )
+            .setRequired(true)
+      ),
+
+  async execute(
+    interaction
+  ) {
     await interaction.deferReply();
 
-    const query = interaction.options.getString("query", true).trim();
-    const guildId = interaction.guild.id;
-    const voiceChannel = interaction.member.voice.channel;
+    const query =
+      interaction.options.getString(
+        "query",
+        true
+      );
+
+    const guildId =
+      interaction.guild.id;
+
+    // ---------------------------------------------
+    // VOICE CHECK
+    // ---------------------------------------------
+
+    const voiceChannel =
+      interaction.member.voice.channel;
 
     if (!voiceChannel) {
       return interaction.editReply(
@@ -43,75 +761,538 @@ module.exports = {
       );
     }
 
+    // ---------------------------------------------
+    // GET PLAYER
+    // ---------------------------------------------
+
+    const data =
+      getGuildPlayer(guildId);
+
+    data.textChannel =
+      interaction.channel;
+
     try {
-      // ----------------------------------------
-      // Convert song name → YouTube search
-      // ----------------------------------------
-      let searchQuery = query;
+      // -------------------------------------------
+      // CONNECT VOICE
+      // -------------------------------------------
 
-      if (!/^https?:\/\//i.test(query)) {
-        searchQuery = `ytsearch1:${query}`;
+      await connectToVoice(
+        interaction,
+        data
+      );
+
+      // -------------------------------------------
+      // RESOLVE SONG
+      // -------------------------------------------
+
+      const track =
+        await resolveTrack(
+          query
+        );
+
+      console.log(
+        `[Music] Selected: ${track.title}`
+      );
+
+      console.log(
+        `[Music] URL: ${track.url}`
+      );
+
+      // -------------------------------------------
+      // ALREADY PLAYING → QUEUE
+      // -------------------------------------------
+
+      if (
+        data.playing ||
+        data.current
+      ) {
+        data.queue.push(
+          track
+        );
+
+        const position =
+          data.queue.length;
+
+        const embed =
+          new EmbedBuilder()
+            .setColor(0x5865f2)
+            .setTitle(
+              "🎵 Added to Queue"
+            )
+            .setDescription(
+              `**${track.title}**`
+            )
+            .addFields({
+              name:
+                "Position",
+              value:
+                `${position}`,
+              inline: true,
+            })
+            .setFooter({
+              text:
+                "VeloByte Music • YouTube",
+            });
+
+        if (
+          track.thumbnail
+        ) {
+          embed.setThumbnail(
+            track.thumbnail
+          );
+        }
+
+        return interaction.editReply({
+          embeds: [embed],
+        });
       }
 
-      // ----------------------------------------
-      // Get YouTube video information
-      // ----------------------------------------
-      const info = await getYoutubeInfo(searchQuery);
+      // -------------------------------------------
+      // NOTHING PLAYING → PLAY NOW
+      // -------------------------------------------
 
-      if (!info || !info.webpage_url) {
+      await playTrack(
+        guildId,
+        track
+      );
+
+      const embed =
+        new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle(
+            "🎵 VeloByte Music"
+          )
+          .setDescription(
+            `▶️ **${track.title}**`
+          )
+          .addFields(
+            {
+              name:
+                "Requested by",
+              value:
+                `${interaction.user}`,
+              inline: true,
+            },
+            {
+              name:
+                "Duration",
+              value:
+                track.duration ||
+                "Unknown",
+              inline: true,
+            }
+          )
+          .setFooter({
+            text:
+              "VeloByte Music • YouTube",
+          });
+
+      if (
+        track.thumbnail
+      ) {
+        embed.setThumbnail(
+          track.thumbnail
+        );
+      }
+
+      return interaction.editReply({
+        embeds: [embed],
+      });
+
+    } catch (error) {
+      console.error(
+        "[Music /play Error]",
+        error
+      );
+
+      // -------------------------------------------
+      // ERRORS
+      // -------------------------------------------
+
+      if (
+        error.message ===
+        "NOT_IN_VOICE"
+      ) {
         return interaction.editReply(
-          "❌ Unable to find this track on YouTube. Try another song or URL."
+          "❌ Join a voice channel first."
         );
       }
 
-      const title = info.title || "Unknown Song";
-      const videoUrl = info.webpage_url;
+      if (
+        error.message ===
+        "DIFFERENT_VOICE"
+      ) {
+        return interaction.editReply(
+          "❌ I am already playing music in another voice channel."
+        );
+      }
 
-      console.log(`🎵 Requested: ${title}`);
-      console.log(`🔗 URL: ${videoUrl}`);
+      if (
+        error.message ===
+        "NO_RESULT"
+      ) {
+        return interaction.editReply(
+          "❌ No YouTube song found for that search."
+        );
+      }
 
-      // ----------------------------------------
-      // Join voice channel
-      // ----------------------------------------
-      let playerData = players.get(guildId);
+      if (
+        error.message ===
+        "EMPTY_QUERY"
+      ) {
+        return interaction.editReply(
+          "❌ Please enter a song name or YouTube URL."
+        );
+      }
 
-      if (!playerData) {
-        const connection = joinVoiceChannel({
-          channelId: voiceChannel.id,
-          guildId: voiceChannel.guild.id,
-          adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-          selfDeaf: true
-        });
+      return interaction.editReply(
+        "❌ Unable to play this track. Check the YouTube URL or try another song."
+      );
+    }
+  },
+};
 
-        const player = createAudioPlayer({
-          behaviors: {
-            noSubscriber: NoSubscriberBehavior.Play
-          }
-        });
+// =========================================================
+// /PAUSE
+// =========================================================
 
-        connection.subscribe(player);
+const pauseCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("pause")
+      .setDescription(
+        "Pause the current song."
+      ),
 
-        playerData = {
-          player,
-          connection,
-          ytdlp: null
-        };
+  async execute(
+    interaction
+  ) {
+    const data =
+      players.get(
+        interaction.guild.id
+      );
 
-        players.set(guildId, playerData);
+    if (
+      !data ||
+      !data.current
+    ) {
+      return interaction.reply({
+        content:
+          "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
 
-        connection.on(
-          VoiceConnectionStatus.Disconnected,
-          () => {
-            console.log(`🔌 Voice disconnected: ${guildId}`);
+    if (data.paused) {
+      return interaction.reply({
+        content:
+          "⏸️ Music is already paused.",
+        ephemeral: true,
+      });
+    }
+
+    data.player.pause();
+    data.paused = true;
+
+    return interaction.reply(
+      "⏸️ Music paused."
+    );
+  },
+};
+
+// =========================================================
+// /RESUME
+// =========================================================
+
+const resumeCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("resume")
+      .setDescription(
+        "Resume the current song."
+      ),
+
+  async execute(
+    interaction
+  ) {
+    const data =
+      players.get(
+        interaction.guild.id
+      );
+
+    if (
+      !data ||
+      !data.current
+    ) {
+      return interaction.reply({
+        content:
+          "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
+
+    if (!data.paused) {
+      return interaction.reply({
+        content:
+          "▶️ Music is already playing.",
+        ephemeral: true,
+      });
+    }
+
+    data.player.unpause();
+    data.paused = false;
+
+    return interaction.reply(
+      "▶️ Music resumed."
+    );
+  },
+};
+
+// =========================================================
+// /SKIP
+// =========================================================
+
+const skipCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("skip")
+      .setDescription(
+        "Skip the current song."
+      ),
+
+  async execute(
+    interaction
+  ) {
+    const guildId =
+      interaction.guild.id;
+
+    const data =
+      players.get(guildId);
+
+    if (
+      !data ||
+      !data.current
+    ) {
+      return interaction.reply({
+        content:
+          "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
+
+    const skipped =
+      data.current.title;
+
+    // ---------------------------------------------
+    // STOP CURRENT TRACK
+    // ---------------------------------------------
+
+    data.stopping = true;
+    data.playing = false;
+    data.paused = false;
+
+    if (data.currentProcess) {
+      try {
+        data.currentProcess.kill(
+          "SIGKILL"
+        );
+      } catch {}
+
+      data.currentProcess =
+        null;
+    }
+
+    try {
+      data.player.stop(true);
+    } catch {}
+
+    data.stopping = false;
+
+    // ---------------------------------------------
+    // NEXT SONG
+    // ---------------------------------------------
+
+    if (
+      data.queue.length > 0
+    ) {
+      const next =
+        data.queue.shift();
+
+      try {
+        await playTrack(
+          guildId,
+          next
+        );
+
+        return interaction.reply(
+          `⏭️ Skipped **${skipped}**\n🎵 Now playing **${next.title}**`
+        );
+      } catch (error) {
+        console.error(
+          "[Music Skip Error]",
+          error
+        );
+
+        data.current = null;
+        data.playing = false;
+
+        return interaction.reply(
+          `⏭️ Skipped **${skipped}**\n❌ Could not play the next song.`
+        );
+      }
+    }
+
+    // ---------------------------------------------
+    // QUEUE EMPTY
+    // ---------------------------------------------
+
+    data.current = null;
+    data.playing = false;
+    data.paused = false;
+
+    return interaction.reply(
+      `⏭️ Skipped **${skipped}**\n📭 Queue is empty.`
+    );
+  },
+};
+
+// =========================================================
+// /QUEUE
+// =========================================================
+
+const queueCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("queue")
+      .setDescription(
+        "Show the music queue."
+      ),
+
+  async execute(
+    interaction
+  ) {
+    const data =
+      players.get(
+        interaction.guild.id
+      );
+
+    if (!data) {
+      return interaction.reply(
+        "📭 Music queue is empty."
+      );
+    }
+
+    const lines = [];
+
+    // ---------------------------------------------
+    // NOW PLAYING
+    // ---------------------------------------------
+
+    if (data.current) {
+      lines.push(
+        `🎵 **Now Playing:** ${data.current.title}`
+      );
+    } else {
+      lines.push(
+        "🎵 **Now Playing:** Nothing"
+      );
+    }
+
+    // ---------------------------------------------
+    // QUEUE
+    // ---------------------------------------------
+
+    if (
+      data.queue.length > 0
+    ) {
+      lines.push("");
+      lines.push(
+        "📋 **Up Next:**"
+      );
+
+      data.queue
+        .slice(0, 10)
+        .forEach(
+          (track, index) => {
+            lines.push(
+              `\`${index + 1}.\` ${track.title}`
+            );
           }
         );
 
-        player.on("error", error => {
-          console.error("❌ Audio Player Error:", error);
+      if (
+        data.queue.length > 10
+      ) {
+        lines.push(
+          `\n...and ${
+            data.queue.length - 10
+          } more`
+        );
+      }
+    } else {
+      lines.push("");
+      lines.push(
+        "📭 Queue is empty."
+      );
+    }
 
-          const data = players.get(guildId);
+    return interaction.reply(
+      lines.join("\n")
+    );
+  },
+};
 
-          if (data) {
+// =========================================================
+// /STOP
+// =========================================================
+
+const stopCommand = {
+  data:
+    new SlashCommandBuilder()
+      .setName("stop")
+      .setDescription(
+        "Stop music and leave the voice channel."
+      ),
+
+  async execute(
+    interaction
+  ) {
+    const guildId =
+      interaction.guild.id;
+
+    const data =
+      players.get(guildId);
+
+    if (!data) {
+      return interaction.reply({
+        content:
+          "❌ Nothing is playing.",
+        ephemeral: true,
+      });
+    }
+
+    cleanupGuild(
+      guildId
+    );
+
+    return interaction.reply(
+      "⏹️ Music stopped and I left the voice channel."
+    );
+  },
+};
+
+// =========================================================
+// EXPORT ALL MUSIC COMMANDS
+// =========================================================
+
+module.exports = [
+  playCommand,
+  pauseCommand,
+  resumeCommand,
+  skipCommand,
+  queueCommand,
+  stopCommand,
+];          if (data) {
             try {
               if (data.ytdlp) {
                 data.ytdlp.kill("SIGKILL");
