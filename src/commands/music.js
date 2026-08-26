@@ -1371,7 +1371,7 @@ module.exports = [
   skipCommand,
   queueCommand,
   stopCommand,
-];      }
+];      
 
       const finishedSong =
         currentData.current?.title || "Unknown";
