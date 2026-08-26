@@ -12,20 +12,12 @@ const {
   AudioPlayerStatus,
   NoSubscriberBehavior,
   StreamType,
-  VoiceConnectionStatus,
-  entersState
+  VoiceConnectionStatus
 } = require("@discordjs/voice");
 
 const { spawn } = require("child_process");
 
 const players = new Map();
-
-const YTDLP_ARGS = [
-  "--js-runtimes",
-  "node",
-  "--remote-components",
-  "ejs:github"
-];
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -34,20 +26,16 @@ module.exports = {
     .addStringOption(option =>
       option
         .setName("query")
-        .setDescription("YouTube song name or YouTube URL")
+        .setDescription("Song name or YouTube URL")
         .setRequired(true)
     ),
 
   async execute(interaction) {
     await interaction.deferReply();
 
-    const query =
-      interaction.options.getString("query")?.trim();
-
+    const query = interaction.options.getString("query", true).trim();
     const guildId = interaction.guild.id;
-
-    const voiceChannel =
-      interaction.member.voice.channel;
+    const voiceChannel = interaction.member.voice.channel;
 
     if (!voiceChannel) {
       return interaction.editReply(
@@ -55,63 +43,345 @@ module.exports = {
       );
     }
 
-    if (!query) {
-      return interaction.editReply(
-        "❌ Enter a song name or YouTube URL."
-      );
-    }
-
-    let connection = null;
-    let ytdlp = null;
-
     try {
-      // ---------------------------------------------
-      // CREATE SEARCH QUERY
-      // ---------------------------------------------
-
+      // ----------------------------------------
+      // Convert song name → YouTube search
+      // ----------------------------------------
       let searchQuery = query;
 
-      if (!/^https?:\/\//i.test(searchQuery)) {
-        searchQuery = `ytsearch1:${searchQuery}`;
+      if (!/^https?:\/\//i.test(query)) {
+        searchQuery = `ytsearch1:${query}`;
       }
 
-      // ---------------------------------------------
-      // GET YOUTUBE INFORMATION
-      // ---------------------------------------------
+      // ----------------------------------------
+      // Get YouTube video information
+      // ----------------------------------------
+      const info = await getYoutubeInfo(searchQuery);
 
-      const info =
-        await getYoutubeInfo(searchQuery);
-
-      if (!info) {
+      if (!info || !info.webpage_url) {
         return interaction.editReply(
-          "❌ Unable to find this song on YouTube."
+          "❌ Unable to find this track on YouTube. Try another song or URL."
         );
       }
 
-      let video = info;
+      const title = info.title || "Unknown Song";
+      const videoUrl = info.webpage_url;
 
-      // ytsearch returns a playlist/search result
-      if (
-        info._type === "playlist" &&
-        Array.isArray(info.entries)
-      ) {
-        video = info.entries.find(
-          entry => entry && entry.webpage_url
+      console.log(`🎵 Requested: ${title}`);
+      console.log(`🔗 URL: ${videoUrl}`);
+
+      // ----------------------------------------
+      // Join voice channel
+      // ----------------------------------------
+      let playerData = players.get(guildId);
+
+      if (!playerData) {
+        const connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: voiceChannel.guild.id,
+          adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+          selfDeaf: true
+        });
+
+        const player = createAudioPlayer({
+          behaviors: {
+            noSubscriber: NoSubscriberBehavior.Play
+          }
+        });
+
+        connection.subscribe(player);
+
+        playerData = {
+          player,
+          connection,
+          ytdlp: null
+        };
+
+        players.set(guildId, playerData);
+
+        connection.on(
+          VoiceConnectionStatus.Disconnected,
+          () => {
+            console.log(`🔌 Voice disconnected: ${guildId}`);
+          }
         );
 
-        if (!video) {
-          return interaction.editReply(
-            "❌ No playable YouTube video found."
-          );
+        player.on("error", error => {
+          console.error("❌ Audio Player Error:", error);
+
+          const data = players.get(guildId);
+
+          if (data) {
+            try {
+              if (data.ytdlp) {
+                data.ytdlp.kill("SIGKILL");
+              }
+            } catch {}
+
+            try {
+              data.connection.destroy();
+            } catch {}
+
+            players.delete(guildId);
+          }
+        });
+      } else {
+        // User changed voice channel
+        if (playerData.connection) {
+          try {
+            playerData.connection.destroy();
+          } catch {}
         }
+
+        const connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: voiceChannel.guild.id,
+          adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+          selfDeaf: true
+        });
+
+        playerData.connection = connection;
+        connection.subscribe(playerData.player);
       }
 
-      const videoUrl =
-        video.webpage_url ||
-        video.original_url;
+      // ----------------------------------------
+      // Stop previous yt-dlp process
+      // ----------------------------------------
+      if (playerData.ytdlp) {
+        try {
+          playerData.ytdlp.kill("SIGKILL");
+        } catch {}
+      }
 
-      if (!videoUrl) {
-        return interaction.editReply(
+      // ----------------------------------------
+      // Start yt-dlp
+      // ----------------------------------------
+      const ytdlp = spawn(
+        "yt-dlp",
+        [
+          "--no-playlist",
+          "--quiet",
+          "--no-warnings",
+
+          // Prefer Opus for Discord
+          "-f",
+          "bestaudio[acodec=opus]/bestaudio/best",
+
+          "-o",
+          "-",
+
+          videoUrl
+        ],
+        {
+          stdio: ["ignore", "pipe", "pipe"]
+        }
+      );
+
+      playerData.ytdlp = ytdlp;
+
+      let ytdlpError = "";
+
+      ytdlp.stderr.on("data", data => {
+        const message = data.toString();
+        ytdlpError += message;
+
+        console.log(`[yt-dlp] ${message.trim()}`);
+      });
+
+      ytdlp.on("error", error => {
+        console.error("❌ yt-dlp process error:", error);
+      });
+
+      // ----------------------------------------
+      // Create Discord audio resource
+      // ----------------------------------------
+      const resource = createAudioResource(
+        ytdlp.stdout,
+        {
+          inputType: StreamType.WebmOpus
+        }
+      );
+
+      playerData.player.play(resource);
+
+      // ----------------------------------------
+      // Playing
+      // ----------------------------------------
+      const playingHandler = () => {
+        console.log(`▶️ Playing: ${title}`);
+      };
+
+      playerData.player.once(
+        AudioPlayerStatus.Playing,
+        playingHandler
+      );
+
+      // ----------------------------------------
+      // Track finished
+      // ----------------------------------------
+      const idleHandler = () => {
+        console.log(`⏹️ Finished: ${title}`);
+
+        try {
+          if (playerData.ytdlp) {
+            playerData.ytdlp.kill("SIGKILL");
+          }
+        } catch {}
+
+        playerData.ytdlp = null;
+      };
+
+      playerData.player.once(
+        AudioPlayerStatus.Idle,
+        idleHandler
+      );
+
+      // ----------------------------------------
+      // yt-dlp finished
+      // ----------------------------------------
+      ytdlp.on("close", code => {
+        console.log(`yt-dlp exited with code: ${code}`);
+
+        if (code !== 0 && code !== null) {
+          console.error(ytdlpError);
+        }
+      });
+
+      // ----------------------------------------
+      // Success Embed
+      // ----------------------------------------
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle("🎵 VeloByte Music")
+        .setDescription(
+          `▶️ **${title}**`
+        )
+        .addFields(
+          {
+            name: "Requested by",
+            value: `${interaction.user}`,
+            inline: true
+          },
+          {
+            name: "Source",
+            value: "YouTube",
+            inline: true
+          }
+        )
+        .setFooter({
+          text: "VeloByte Music • YouTube"
+        });
+
+      return interaction.editReply({
+        embeds: [embed]
+      });
+
+    } catch (error) {
+      console.error("❌ Music Error:", error);
+
+      return interaction.editReply(
+        "❌ Unable to play this track. Check the YouTube URL or try another song."
+      );
+    }
+  }
+};
+
+
+// ==================================================
+// Get YouTube information using yt-dlp
+// ==================================================
+
+function getYoutubeInfo(query) {
+  return new Promise((resolve, reject) => {
+
+    const args = [
+      "--dump-single-json",
+      "--no-playlist",
+      "--skip-download",
+
+      // YouTube extractor settings
+      "--extractor-args",
+      "youtube:player_client=android,web",
+
+      query
+    ];
+
+    const process = spawn("yt-dlp", args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let output = "";
+    let errorOutput = "";
+
+    process.stdout.on("data", data => {
+      output += data.toString();
+    });
+
+    process.stderr.on("data", data => {
+      errorOutput += data.toString();
+    });
+
+    process.on("error", error => {
+      reject(error);
+    });
+
+    process.on("close", code => {
+
+      if (code !== 0) {
+        console.error(
+          "yt-dlp info error:",
+          errorOutput
+        );
+
+        return reject(
+          new Error("yt-dlp failed to get YouTube information")
+        );
+      }
+
+      try {
+        const info = JSON.parse(output);
+
+        // ytsearch result
+        if (
+          info &&
+          Array.isArray(info.entries)
+        ) {
+          const video = info.entries.find(
+            entry => entry && entry.webpage_url
+          );
+
+          if (!video) {
+            return reject(
+              new Error("No YouTube video found")
+            );
+          }
+
+          return resolve(video);
+        }
+
+        // Direct YouTube URL
+        if (
+          info &&
+          info.webpage_url
+        ) {
+          return resolve(info);
+        }
+
+        reject(
+          new Error("Invalid YouTube information")
+        );
+
+      } catch (error) {
+        console.error(
+          "JSON parse error:",
+          error
+        );
+
+        reject(error);
+      }
+    });
+  });
+}        return interaction.editReply(
           "❌ Unable to get the YouTube video URL."
         );
       }
