@@ -1,720 +1,781 @@
-const { SlashCommandBuilder } = require("discord.js");
+// src/commands/music.js
+
+const {
+  SlashCommandBuilder,
+  EmbedBuilder,
+} = require("discord.js");
+
 const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
+  NoSubscriberBehavior,
+  StreamType,
   entersState,
 } = require("@discordjs/voice");
-const play = require("play-dl");
+
+const { spawn } = require("child_process");
 
 const players = new Map();
 
-function getPlayer(guildId) {
-  let data = players.get(guildId);
+/* =========================================================
+   MUSIC STATE
+========================================================= */
 
-  if (!data) {
-    const player = createAudioPlayer();
+function createGuildPlayer(guildId) {
+  const player = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Play,
+    },
+  });
 
-    data = {
-      player,
-      connection: null,
-      queue: [],
-      current: null,
-      playing: false,
-    };
+  const data = {
+    player,
+    connection: null,
+    queue: [],
+    current: null,
+    currentProcess: null,
+    textChannel: null,
+    playing: false,
+    paused: false,
+    stopping: false,
+  };
 
-    player.on("error", (error) => {
-      console.error("[Music Player Error]", error);
-      data.playing = false;
-    });
+  player.on("error", (error) => {
+    console.error(`[Music] Audio player error (${guildId}):`, error);
 
-    player.on(AudioPlayerStatus.Idle, async () => {
-      data.playing = false;
+    data.playing = false;
+    data.paused = false;
 
-      if (data.queue.length > 0) {
-        const next = data.queue.shift();
+    if (data.currentProcess) {
+      try {
+        data.currentProcess.kill("SIGKILL");
+      } catch {}
+      data.currentProcess = null;
+    }
 
-        try {
-          await playTrack(guildId, next.url, next.title);
-        } catch (error) {
-          console.error("[Music Next Track Error]", error);
+    // Try next song instead of completely killing music system
+    if (!data.stopping && data.queue.length > 0) {
+      playNext(guildId).catch((err) => {
+        console.error("[Music] Auto next error:", err);
+      });
+    }
+  });
+
+  player.on(AudioPlayerStatus.Idle, async () => {
+    if (data.stopping) return;
+
+    data.playing = false;
+    data.paused = false;
+
+    if (data.currentProcess) {
+      try {
+        data.currentProcess.kill("SIGKILL");
+      } catch {}
+
+      data.currentProcess = null;
+    }
+
+    data.current = null;
+
+    if (data.queue.length > 0) {
+      await playNext(guildId);
+    } else {
+      // Leave after 30 seconds if nothing is queued
+      setTimeout(() => {
+        const current = players.get(guildId);
+
+        if (
+          current &&
+          !current.playing &&
+          !current.paused &&
+          current.queue.length === 0
+        ) {
+          cleanupGuild(guildId);
         }
-      } else {
-        data.current = null;
-      }
-    });
+      }, 30000);
+    }
+  });
 
-    players.set(guildId, data);
-  }
+  players.set(guildId, data);
 
   return data;
 }
 
-async function getYouTubeTrack(query) {
-  // Direct YouTube URL
-  if (/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(query)) {
-    try {
-      const info = await play.video_info(query);
-
-      return {
-        url: query,
-        title: info.video_details?.title || query,
-      };
-    } catch (error) {
-      console.error("[YouTube URL Error]", error);
-      throw new Error("Unable to read this YouTube URL.");
-    }
-  }
-
-  // Search by song name
-  const results = await play.search(query, {
-    limit: 1,
-    source: { youtube: "video" },
-  });
-
-  if (!results || !results.length) {
-    throw new Error("No YouTube result found.");
-  }
-
-  return {
-    url: results[0].url,
-    title: results[0].title || query,
-  };
+function getGuildPlayer(guildId) {
+  return players.get(guildId) || createGuildPlayer(guildId);
 }
 
-async function playTrack(guildId, url, title) {
+/* =========================================================
+   CLEANUP
+========================================================= */
+
+function cleanupGuild(guildId) {
   const data = players.get(guildId);
 
-  if (!data || !data.connection) {
-    throw new Error("Voice connection is not available.");
+  if (!data) return;
+
+  data.stopping = true;
+
+  if (data.currentProcess) {
+    try {
+      data.currentProcess.kill("SIGKILL");
+    } catch {}
+
+    data.currentProcess = null;
   }
-
-  // Get YouTube stream
-  const stream = await play.stream(url, {
-    quality: 2,
-    discordPlayerCompatibility: true,
-  });
-
-  const resource = createAudioResource(stream.stream, {
-    inputType: stream.type,
-    inlineVolume: false,
-  });
-
-  data.current = {
-    title,
-    url,
-  };
-
-  data.playing = true;
-  data.player.play(resource);
-}
-
-module.exports = [
-  {
-    data: new SlashCommandBuilder()
-      .setName("play")
-      .setDescription("Play music from YouTube.")
-      .addStringOption((option) =>
-        option
-          .setName("query")
-          .setDescription("Song name or YouTube URL")
-          .setRequired(true)
-      ),
-
-    async execute(interaction) {
-      const voiceChannel = interaction.member?.voice?.channel;
-
-      if (!voiceChannel) {
-        return interaction.reply({
-          content: "❌ Join a voice channel first.",
-          ephemeral: true,
-        });
-      }
-
-      await interaction.deferReply();
-
-      const query = interaction.options.getString("query", true);
-      const guildId = interaction.guild.id;
-      const data = getPlayer(guildId);
-
-      try {
-        // Create voice connection
-        if (!data.connection) {
-          data.connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
-            guildId,
-            adapterCreator: interaction.guild.voiceAdapterCreator,
-            selfDeaf: true,
-            selfMute: false,
-          });
-
-          await entersState(
-            data.connection,
-            VoiceConnectionStatus.Ready,
-            15_000
-          );
-
-          data.connection.subscribe(data.player);
-        } else {
-          // Make sure bot is in the same voice channel
-          const currentChannelId = data.connection.joinConfig.channelId;
-
-          if (currentChannelId !== voiceChannel.id) {
-            return interaction.editReply(
-              "❌ I am already playing music in another voice channel."
-            );
-          }
-        }
-
-        const track = await getYouTubeTrack(query);
-
-        // If something is already playing, add to queue
-        if (data.playing) {
-          data.queue.push(track);
-
-          return interaction.editReply(
-            `📀 Added to queue: **${track.title}**\n` +
-              `📋 Position: **${data.queue.length}**`
-          );
-        }
-
-        await playTrack(guildId, track.url, track.title);
-
-        return interaction.editReply(
-          `🎵 Now playing: **${track.title}**\n` +
-            `🔊 Voice: ${voiceChannel}`
-        );
-      } catch (error) {
-        console.error("[Play Command Error]", error);
-
-        return interaction.editReply(
-          "❌ Unable to play this track. YouTube may have blocked the stream. Try another song or YouTube URL."
-        );
-      }
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("pause")
-      .setDescription("Pause music."),
-
-    async execute(interaction) {
-      const data = players.get(interaction.guild.id);
-
-      if (!data || !data.playing) {
-        return interaction.reply({
-          content: "❌ Nothing is playing.",
-          ephemeral: true,
-        });
-      }
-
-      data.player.pause();
-
-      await interaction.reply("⏸️ Music paused.");
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("resume")
-      .setDescription("Resume music."),
-
-    async execute(interaction) {
-      const data = players.get(interaction.guild.id);
-
-      if (!data) {
-        return interaction.reply({
-          content: "❌ Nothing is playing.",
-          ephemeral: true,
-        });
-      }
-
-      data.player.unpause();
-
-      await interaction.reply("▶️ Music resumed.");
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("skip")
-      .setDescription("Skip current song."),
-
-    async execute(interaction) {
-      const data = players.get(interaction.guild.id);
-
-      if (!data || !data.playing) {
-        return interaction.reply({
-          content: "❌ Nothing is playing.",
-          ephemeral: true,
-        });
-      }
-
-      data.player.stop();
-
-      await interaction.reply("⏭️ Skipped.");
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("queue")
-      .setDescription("Show music queue."),
-
-    async execute(interaction) {
-      const data = players.get(interaction.guild.id);
-
-      if (!data) {
-        return interaction.reply("🎵 Nothing is playing.");
-      }
-
-      const lines = [];
-
-      if (data.current) {
-        lines.push(`🎵 **Now Playing:** ${data.current.title}`);
-      }
-
-      if (data.queue.length) {
-        lines.push(
-          "",
-          "📋 **Queue:**",
-          ...data.queue.map(
-            (track, index) => `${index + 1}. ${track.title}`
-          )
-        );
-      }
-
-      if (!lines.length) {
-        return interaction.reply("🎵 Nothing is playing.");
-      }
-
-      await interaction.reply(lines.join("\n"));
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("stop")
-      .setDescription("Stop music and leave voice channel."),
-
-    async execute(interaction) {
-      const data = players.get(interaction.guild.id);
-
-      if (!data) {
-        return interaction.reply({
-          content: "❌ Nothing is playing.",
-          ephemeral: true,
-        });
-      }
-
-      data.queue = [];
-      data.current = null;
-      data.playing = false;
-
-      data.player.stop();
-
-      if (data.connection) {
-        data.connection.destroy();
-      }
-
-      players.delete(interaction.guild.id);
-
-      await interaction.reply("⏹️ Music stopped and disconnected.");
-    },
-  },
-];  if (/^https?:\/\/.+/i.test(query)) {
-    return {
-      title: query,
-      url: query,
-    };
-  }
-
-  const results = await play.search(query, {
-    limit: 5,
-    source: {
-      youtube: "video",
-    },
-  });
-
-  if (!results || results.length === 0) {
-    return null;
-  }
-
-  const result = results[0];
-
-  return {
-    title: result.title || query,
-    url: result.url,
-    duration: result.durationRaw || "Unknown",
-    thumbnail: result.thumbnails?.[0]?.url || null,
-  };
-}
-
-async function playTrack(guildId, track) {
-  const music = guildMusic.get(guildId);
-
-  if (!music) return false;
 
   try {
-    const stream = await play.stream(track.url, {
-      discordPlayerCompatibility: true,
+    data.player.stop(true);
+  } catch {}
+
+  try {
+    data.connection?.destroy();
+  } catch {}
+
+  data.queue = [];
+  data.current = null;
+  data.playing = false;
+  data.paused = false;
+
+  players.delete(guildId);
+}
+
+/* =========================================================
+   YOUTUBE INFO
+========================================================= */
+
+function getYoutubeInfo(query) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--dump-single-json",
+      "--no-playlist",
+      "--skip-download",
+      "--no-warnings",
+      query,
+    ];
+
+    const process = spawn("yt-dlp", args);
+
+    let output = "";
+    let errorOutput = "";
+
+    process.stdout.on("data", (data) => {
+      output += data.toString();
     });
 
-    const resource = createAudioResource(stream.stream, {
-      inputType: stream.type,
-      inlineVolume: true,
+    process.stderr.on("data", (data) => {
+      errorOutput += data.toString();
     });
 
-    resource.volume?.setVolume(1.0);
+    process.on("error", (error) => {
+      reject(error);
+    });
 
-    music.current = track;
-    music.playing = true;
+    process.on("close", (code) => {
+      if (code !== 0) {
+        console.error("[yt-dlp info error]", errorOutput);
+        return reject(new Error("yt-dlp failed"));
+      }
 
-    music.player.play(resource);
+      try {
+        const info = JSON.parse(output);
+        resolve(info);
+      } catch (error) {
+        console.error("[yt-dlp JSON error]", error);
+        reject(error);
+      }
+    });
+  });
+}
+
+/* =========================================================
+   SEARCH / URL RESOLVER
+========================================================= */
+
+async function resolveTrack(query) {
+  const cleanQuery = query.trim();
+
+  if (!cleanQuery) {
+    throw new Error("EMPTY_QUERY");
+  }
+
+  let searchQuery = cleanQuery;
+
+  // Direct YouTube URL
+  if (
+    /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(cleanQuery)
+  ) {
+    searchQuery = cleanQuery;
+  } else {
+    // YouTube search
+    searchQuery = `ytsearch1:${cleanQuery}`;
+  }
+
+  const info = await getYoutubeInfo(searchQuery);
+
+  if (!info) {
+    throw new Error("NO_RESULT");
+  }
+
+  // ytsearch returns entries[]
+  let video = info;
+
+  if (Array.isArray(info.entries)) {
+    video = info.entries[0];
+  }
+
+  if (!video || !video.webpage_url) {
+    throw new Error("NO_RESULT");
+  }
+
+  return {
+    title: video.title || "Unknown Song",
+    url: video.webpage_url,
+    duration: video.duration_string || "Unknown",
+    thumbnail:
+      video.thumbnail ||
+      (Array.isArray(video.thumbnails) && video.thumbnails.length
+        ? video.thumbnails[video.thumbnails.length - 1].url
+        : null),
+  };
+}
+
+/* =========================================================
+   VOICE CONNECTION
+========================================================= */
+
+async function connectToVoice(interaction, data) {
+  const voiceChannel = interaction.member.voice.channel;
+
+  if (!voiceChannel) {
+    throw new Error("NOT_IN_VOICE");
+  }
+
+  if (data.connection) {
+    const currentChannelId = data.connection.joinConfig.channelId;
+
+    if (currentChannelId !== voiceChannel.id) {
+      throw new Error("DIFFERENT_VOICE");
+    }
+
+    return data.connection;
+  }
+
+  data.connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: interaction.guild.id,
+    adapterCreator: interaction.guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: false,
+  });
+
+  await entersState(
+    data.connection,
+    VoiceConnectionStatus.Ready,
+    20000
+  );
+
+  data.connection.subscribe(data.player);
+
+  return data.connection;
+}
+
+/* =========================================================
+   START TRACK
+========================================================= */
+
+async function playTrack(guildId, track) {
+  const data = players.get(guildId);
+
+  if (!data) {
+    throw new Error("PLAYER_NOT_FOUND");
+  }
+
+  if (!data.connection) {
+    throw new Error("VOICE_NOT_CONNECTED");
+  }
+
+  // Kill previous yt-dlp process if any
+  if (data.currentProcess) {
+    try {
+      data.currentProcess.kill("SIGKILL");
+    } catch {}
+
+    data.currentProcess = null;
+  }
+
+  data.current = track;
+  data.playing = true;
+  data.paused = false;
+  data.stopping = false;
+
+  /*
+   * yt-dlp:
+   * - Download best audio
+   * - Output directly to stdout
+   * - No playlist
+   *
+   * We use WebM/Opus when available because Discord voice
+   * can consume it directly.
+   */
+
+  const ytdlp = spawn(
+    "yt-dlp",
+    [
+      "--no-playlist",
+      "--no-warnings",
+      "--ignore-errors",
+      "-f",
+      "bestaudio[acodec=opus]/bestaudio",
+      "-o",
+      "-",
+      track.url,
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
+
+  data.currentProcess = ytdlp;
+
+  ytdlp.stderr.on("data", (chunk) => {
+    const message = chunk.toString().trim();
+
+    if (message) {
+      console.log(`[yt-dlp] ${message}`);
+    }
+  });
+
+  ytdlp.on("error", (error) => {
+    console.error("[Music] yt-dlp process error:", error);
+
+    data.playing = false;
+    data.paused = false;
+
+    if (data.currentProcess === ytdlp) {
+      data.currentProcess = null;
+    }
+
+    if (data.queue.length > 0 && !data.stopping) {
+      playNext(guildId).catch((err) => {
+        console.error("[Music] Failed to play next:", err);
+      });
+    }
+  });
+
+  ytdlp.on("close", (code) => {
+    console.log(`[yt-dlp] process exited with code ${code}`);
+
+    if (data.currentProcess === ytdlp) {
+      data.currentProcess = null;
+    }
+  });
+
+  /*
+   * WebM Opus is preferred.
+   * If YouTube gives another codec, FFmpeg/yt-dlp should
+   * normally handle the selected audio format.
+   */
+  const resource = createAudioResource(ytdlp.stdout, {
+    inputType: StreamType.WebmOpus,
+    inlineVolume: true,
+  });
+
+  if (resource.volume) {
+    resource.volume.setVolume(1.0);
+  }
+
+  data.player.play(resource);
+
+  return track;
+}
+
+/* =========================================================
+   PLAY NEXT
+========================================================= */
+
+async function playNext(guildId) {
+  const data = players.get(guildId);
+
+  if (!data || data.stopping) {
+    return false;
+  }
+
+  if (!data.queue.length) {
+    data.current = null;
+    data.playing = false;
+    data.paused = false;
+    return false;
+  }
+
+  const nextTrack = data.queue.shift();
+
+  try {
+    await playTrack(guildId, nextTrack);
+
+    if (data.textChannel) {
+      try {
+        await data.textChannel.send(
+          `🎵 Now playing: **${nextTrack.title}**`
+        );
+      } catch {}
+    }
 
     return true;
   } catch (error) {
-    console.error(
-      `[Music] Failed to play "${track.title}":`,
-      error
-    );
+    console.error("[Music] Next track failed:", error);
 
-    music.playing = false;
-    music.current = null;
+    data.current = null;
+    data.playing = false;
 
-    return false;
-  }
-}
-
-async function playNext(guildId) {
-  const music = guildMusic.get(guildId);
-
-  if (!music || music.queue.length === 0) {
-    if (music) {
-      music.current = null;
-      music.playing = false;
-    }
-
-    return false;
-  }
-
-  const nextTrack = music.queue.shift();
-
-  const success = await playTrack(guildId, nextTrack);
-
-  if (!success) {
-    if (music.queue.length > 0) {
+    if (data.queue.length > 0) {
       return playNext(guildId);
     }
 
     return false;
   }
-
-  return true;
 }
 
-function formatQueue(music) {
-  const lines = [];
+/* =========================================================
+   COMMANDS
+========================================================= */
 
-  if (music.current) {
-    lines.push(
-      `🎵 **Now Playing:** ${music.current.title}`
-    );
-  } else {
-    lines.push("🎵 **Now Playing:** Nothing");
-  }
+const playCommand = {
+  data: new SlashCommandBuilder()
+    .setName("play")
+    .setDescription("Play a song from YouTube")
+    .addStringOption((option) =>
+      option
+        .setName("query")
+        .setDescription("Song name or YouTube URL")
+        .setRequired(true)
+    ),
 
-  if (music.queue.length > 0) {
-    lines.push("");
-    lines.push("📜 **Up Next:**");
+  async execute(interaction) {
+    await interaction.deferReply();
 
-    music.queue.slice(0, 10).forEach((track, index) => {
-      lines.push(
-        `\`${index + 1}.\` ${track.title}`
-      );
-    });
+    const query = interaction.options.getString("query", true);
+    const guildId = interaction.guild.id;
 
-    if (music.queue.length > 10) {
-      lines.push(
-        `\n...and ${music.queue.length - 10} more`
+    const voiceChannel = interaction.member.voice.channel;
+
+    if (!voiceChannel) {
+      return interaction.editReply(
+        "❌ Join a voice channel first."
       );
     }
-  } else {
-    lines.push("\n📭 Queue is empty.");
-  }
 
-  return lines.join("\n");
-}
+    const data = getGuildPlayer(guildId);
 
-function getMusicOrReply(interaction) {
-  const music = guildMusic.get(interaction.guild.id);
+    data.textChannel = interaction.channel;
 
-  if (!music) {
-    interaction.reply({
-      content: "🎵 Nothing is playing right now.",
-      ephemeral: true,
-    });
+    try {
+      await connectToVoice(interaction, data);
 
-    return null;
-  }
+      const track = await resolveTrack(query);
 
-  return music;
-}
+      // Already playing → queue
+      if (data.playing || data.current) {
+        data.queue.push(track);
 
-const commands = [
-  {
-    data: new SlashCommandBuilder()
-      .setName("play")
-      .setDescription("Play music from YouTube or a URL.")
-      .addStringOption((option) =>
-        option
-          .setName("query")
-          .setDescription("Song name or URL")
-          .setRequired(true)
-      ),
+        const embed = new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle("🎵 Added to Queue")
+          .setDescription(`**${track.title}**`)
+          .addFields({
+            name: "Position",
+            value: `${data.queue.length}`,
+            inline: true,
+          })
+          .setFooter({
+            text: "VeloByte Music • YouTube",
+          });
 
-    async execute(interaction) {
-      const query = interaction.options.getString("query", true);
+        return interaction.editReply({
+          embeds: [embed],
+        });
+      }
 
-      let music = getGuildMusic(interaction.guild.id);
+      // Nothing playing → start immediately
+      await playTrack(guildId, track);
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle("🎵 VeloByte Music")
+        .setDescription(`▶️ **${track.title}**`)
+        .addFields(
+          {
+            name: "Requested by",
+            value: `${interaction.user}`,
+            inline: true,
+          },
+          {
+            name: "Duration",
+            value: track.duration || "Unknown",
+            inline: true,
+          }
+        )
+        .setFooter({
+          text: "VeloByte Music • YouTube",
+        });
+
+      if (track.thumbnail) {
+        embed.setThumbnail(track.thumbnail);
+      }
+
+      return interaction.editReply({
+        embeds: [embed],
+      });
+    } catch (error) {
+      console.error("[Music /play Error]", error);
+
+      if (error.message === "NOT_IN_VOICE") {
+        return interaction.editReply(
+          "❌ Join a voice channel first."
+        );
+      }
+
+      if (error.message === "DIFFERENT_VOICE") {
+        return interaction.editReply(
+          "❌ I am already playing music in another voice channel."
+        );
+      }
+
+      if (error.message === "NO_RESULT") {
+        return interaction.editReply(
+          "❌ No YouTube song found for that search."
+        );
+      }
+
+      if (error.message === "EMPTY_QUERY") {
+        return interaction.editReply(
+          "❌ Please enter a song name or YouTube URL."
+        );
+      }
+
+      return interaction.editReply(
+        "❌ Unable to play this track. Check the YouTube URL or try another song."
+      );
+    }
+  },
+};
+
+/* =========================================================
+   PAUSE
+========================================================= */
+
+const pauseCommand = {
+  data: new SlashCommandBuilder()
+    .setName("pause")
+    .setDescription("Pause the current song."),
+
+  async execute(interaction) {
+    const data = players.get(interaction.guild.id);
+
+    if (!data || !data.current) {
+      return interaction.reply({
+        content: "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
+
+    if (data.paused) {
+      return interaction.reply({
+        content: "⏸️ Music is already paused.",
+        ephemeral: true,
+      });
+    }
+
+    data.player.pause();
+    data.paused = true;
+
+    return interaction.reply("⏸️ Music paused.");
+  },
+};
+
+/* =========================================================
+   RESUME
+========================================================= */
+
+const resumeCommand = {
+  data: new SlashCommandBuilder()
+    .setName("resume")
+    .setDescription("Resume the current song."),
+
+  async execute(interaction) {
+    const data = players.get(interaction.guild.id);
+
+    if (!data || !data.current) {
+      return interaction.reply({
+        content: "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
+
+    if (!data.paused) {
+      return interaction.reply({
+        content: "▶️ Music is already playing.",
+        ephemeral: true,
+      });
+    }
+
+    data.player.unpause();
+    data.paused = false;
+
+    return interaction.reply("▶️ Music resumed.");
+  },
+};
+
+/* =========================================================
+   SKIP
+========================================================= */
+
+const skipCommand = {
+  data: new SlashCommandBuilder()
+    .setName("skip")
+    .setDescription("Skip the current song."),
+
+  async execute(interaction) {
+    const data = players.get(interaction.guild.id);
+
+    if (!data || !data.current) {
+      return interaction.reply({
+        content: "❌ Nothing is currently playing.",
+        ephemeral: true,
+      });
+    }
+
+    const skipped = data.current.title;
+
+    // Prevent Idle handler from doing duplicate cleanup
+    data.playing = false;
+    data.paused = false;
+
+    if (data.currentProcess) {
+      try {
+        data.currentProcess.kill("SIGKILL");
+      } catch {}
+
+      data.currentProcess = null;
+    }
+
+    data.player.stop(true);
+
+    if (data.queue.length > 0) {
+      const next = data.queue.shift();
 
       try {
-        const voiceChannel = await connectToVoice(
-          interaction,
-          music
-        );
+        await playTrack(interaction.guild.id, next);
 
-        music.textChannel = interaction.channel;
-
-        await interaction.deferReply();
-
-        const track = await resolveQuery(query);
-
-        if (!track) {
-          return interaction.editReply(
-            "❌ No music found for that search."
-          );
-        }
-
-        if (music.playing || music.current) {
-          music.queue.push(track);
-
-          return interaction.editReply(
-            `➕ Added to queue: **${track.title}**\n` +
-            `📍 Position: **${music.queue.length}**`
-          );
-        }
-
-        music.queue.push(track);
-
-        const started = await playNext(interaction.guild.id);
-
-        if (!started) {
-          return interaction.editReply(
-            "❌ Unable to play this track. Try another song."
-          );
-        }
-
-        return interaction.editReply(
-          `🎵 Now playing **${track.title}** in ${voiceChannel}.`
+        return interaction.reply(
+          `⏭️ Skipped **${skipped}**\n🎵 Now playing **${next.title}**`
         );
       } catch (error) {
-        console.error("[Music] Play command error:", error);
+        console.error("[Music Skip Error]", error);
 
-        if (error.message === "JOIN_VOICE") {
-          if (interaction.deferred) {
-            return interaction.editReply(
-              "❌ Join a voice channel first."
-            );
-          }
-
-          return interaction.reply({
-            content: "❌ Join a voice channel first.",
-            ephemeral: true,
-          });
-        }
-
-        if (error.message === "DIFFERENT_VOICE") {
-          if (interaction.deferred) {
-            return interaction.editReply(
-              "❌ I am already playing music in another voice channel."
-            );
-          }
-
-          return interaction.reply({
-            content:
-              "❌ I am already playing music in another voice channel.",
-            ephemeral: true,
-          });
-        }
-
-        if (interaction.deferred) {
-          return interaction.editReply(
-            "❌ Music playback failed."
-          );
-        }
-
-        return interaction.reply({
-          content: "❌ Music playback failed.",
-          ephemeral: true,
-        });
-      }
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("pause")
-      .setDescription("Pause the current music."),
-
-    async execute(interaction) {
-      const music = getMusicOrReply(interaction);
-      if (!music) return;
-
-      if (music.player.state.status === AudioPlayerStatus.Paused) {
-        return interaction.reply({
-          content: "⏸️ Music is already paused.",
-          ephemeral: true,
-        });
-      }
-
-      if (!music.current) {
-        return interaction.reply({
-          content: "❌ Nothing is currently playing.",
-          ephemeral: true,
-        });
-      }
-
-      music.player.pause();
-
-      return interaction.reply("⏸️ Music paused.");
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("resume")
-      .setDescription("Resume the paused music."),
-
-    async execute(interaction) {
-      const music = getMusicOrReply(interaction);
-      if (!music) return;
-
-      if (!music.current) {
-        return interaction.reply({
-          content: "❌ Nothing is currently playing.",
-          ephemeral: true,
-        });
-      }
-
-      if (
-        music.player.state.status !==
-        AudioPlayerStatus.Paused
-      ) {
-        return interaction.reply({
-          content: "▶️ Music is already playing.",
-          ephemeral: true,
-        });
-      }
-
-      music.player.unpause();
-
-      return interaction.reply("▶️ Music resumed.");
-    },
-  },
-
-  {
-    data: new SlashCommandBuilder()
-      .setName("skip")
-      .setDescription("Skip the current song."),
-
-    async execute(interaction) {
-      const music = getMusicOrReply(interaction);
-      if (!music) return;
-
-      if (!music.current) {
-        return interaction.reply({
-          content: "❌ Nothing is currently playing.",
-          ephemeral: true,
-        });
-      }
-
-      const skipped = music.current.title;
-
-      music.playing = false;
-      music.player.stop(true);
-
-      const started = await playNext(interaction.guild.id);
-
-      if (started) {
         return interaction.reply(
-          `⏭️ Skipped **${skipped}**.\n🎵 Now playing **${music.current.title}**`
+          `⏭️ Skipped **${skipped}**\n❌ Could not play the next song.`
         );
       }
+    }
 
-      return interaction.reply(
-        `⏭️ Skipped **${skipped}**.\n📭 Queue is empty.`
-      );
-    },
+    data.current = null;
+
+    return interaction.reply(
+      `⏭️ Skipped **${skipped}**\n📭 Queue is empty.`
+    );
   },
+};
 
-  {
-    data: new SlashCommandBuilder()
-      .setName("queue")
-      .setDescription("Show the current music queue."),
+/* =========================================================
+   QUEUE
+========================================================= */
 
-    async execute(interaction) {
-      const music = guildMusic.get(interaction.guild.id);
+const queueCommand = {
+  data: new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Show the music queue."),
 
-      if (!music) {
-        return interaction.reply(
-          "📭 Music queue is empty."
+  async execute(interaction) {
+    const data = players.get(interaction.guild.id);
+
+    if (!data) {
+      return interaction.reply("📭 Music queue is empty.");
+    }
+
+    const lines = [];
+
+    if (data.current) {
+      lines.push(
+        `🎵 **Now Playing:** ${data.current.title}`
+      );
+    } else {
+      lines.push("🎵 **Now Playing:** Nothing");
+    }
+
+    if (data.queue.length > 0) {
+      lines.push("");
+      lines.push("📋 **Up Next:**");
+
+      data.queue.slice(0, 10).forEach((track, index) => {
+        lines.push(
+          `\`${index + 1}.\` ${track.title}`
+        );
+      });
+
+      if (data.queue.length > 10) {
+        lines.push(
+          `\n...and ${data.queue.length - 10} more`
         );
       }
+    } else {
+      lines.push("");
+      lines.push("📭 Queue is empty.");
+    }
 
-      return interaction.reply(
-        formatQueue(music)
-      );
-    },
+    return interaction.reply(lines.join("\n"));
   },
+};
 
-  {
-    data: new SlashCommandBuilder()
-      .setName("stop")
-      .setDescription("Stop music and leave the voice channel."),
+/* =========================================================
+   STOP
+========================================================= */
 
-    async execute(interaction) {
-      const music = guildMusic.get(interaction.guild.id);
+const stopCommand = {
+  data: new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop music and leave the voice channel."),
 
-      if (!music) {
-        return interaction.reply({
-          content: "❌ Nothing is playing.",
-          ephemeral: true,
-        });
-      }
+  async execute(interaction) {
+    const data = players.get(interaction.guild.id);
 
-      music.queue.length = 0;
-      music.current = null;
-      music.playing = false;
+    if (!data) {
+      return interaction.reply({
+        content: "❌ Nothing is playing.",
+        ephemeral: true,
+      });
+    }
 
-      try {
-        music.player.stop(true);
-      } catch {}
+    cleanupGuild(interaction.guild.id);
 
-      try {
-        music.connection?.destroy();
-      } catch {}
-
-      guildMusic.delete(interaction.guild.id);
-
-      return interaction.reply(
-        "⏹️ Music stopped and I left the voice channel."
-      );
-    },
+    return interaction.reply(
+      "⏹️ Music stopped and I left the voice channel."
+    );
   },
+};
+
+/* =========================================================
+   EXPORT ALL MUSIC COMMANDS
+========================================================= */
+
+module.exports = [
+  playCommand,
+  pauseCommand,
+  resumeCommand,
+  skipCommand,
+  queueCommand,
+  stopCommand,
 ];
-
-module.exports = commands;
