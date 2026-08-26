@@ -726,8 +726,9 @@ function playTrack(
 
         "-f",
 
-        "bestaudio[acodec=opus][container=webm]/bestaudio[acodec=opus]/bestaudio[ext=webm]",
-
+        "bestaudio/best",
+        "--extractor-args",
+        "youtube:player_client=web_safari",
         "--no-part",
 
         "-o",
