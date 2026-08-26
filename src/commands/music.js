@@ -766,27 +766,45 @@ function playTrack(
       // ==================================================
 
       const ffmpeg =
-        spawn(
-          "ffmpeg",
-          [
-            "-hide_banner",
+         spawn(
+           "ffmpeg",
+           [
+             "-hide_banner",
 
-            "-loglevel",
-            "error",
+             "-loglevel",
+             "error",
 
-            "-i",
-            "pipe:0",
+             "-i",
+             "pipe:0",
 
-            "-vn",
+             "-vn",
 
-            "-c:a",
-            "copy",
+             "-c:a",
+             "libopus",
 
-            "-f",
-            "ogg",
+             "-b:a",
+             "192k",
+ 
+             "-vbr",
+             "on",
 
-            "pipe:1",
-          ],
+             "-compression_level",
+             "10",
+
+             "-application",
+             "audio",
+ 
+             "-ar",
+             "48000",
+
+             "-ac",
+             "2",
+
+             "-f",
+             "ogg",
+
+             "pipe:1",
+           ],
           {
             stdio: [
               "pipe",
