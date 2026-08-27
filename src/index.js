@@ -968,16 +968,54 @@ client.on(
 
           const thread = await guild.channels.fetch(threadId).catch(() => null);
 
-          if (thread?.isThread()) {
-            await thread.send(
-              `🔒 **ModMail closed by ${interaction.user}.**`
-            ).catch(() => {});
+if (thread?.isThread()) {
+  await thread.send(
+    `🔒 **ModMail closed by ${interaction.user}.**\n` +
+    `🗑️ This conversation will be deleted in 5 seconds.`
+  ).catch(() => {});
 
-            setTimeout(() => {
-              thread.setArchived(true).catch(() => {});
-              thread.setLocked(true).catch(() => {});
-            }, 1500);
-          }
+  // Get the original ModMail inbox message
+  // before deleting the thread.
+  const starterMessage = await thread
+    .fetchStarterMessage()
+    .catch(() => null);
+
+  setTimeout(async () => {
+    try {
+      // Delete the ModMail conversation thread
+      await thread.delete(
+        "ModMail conversation closed"
+      );
+
+      console.log(
+        `[ModMail] Thread deleted: ${thread.id}`
+      );
+    } catch (error) {
+      console.error(
+        `[ModMail] Failed to delete thread ${thread.id}:`,
+        error.message
+      );
+    }
+
+    // Delete the original inbox message too
+    if (starterMessage) {
+      try {
+        await starterMessage.delete(
+          "ModMail inbox message deleted after closing"
+        );
+
+        console.log(
+          `[ModMail] Inbox message deleted: ${starterMessage.id}`
+        );
+      } catch (error) {
+        console.error(
+          `[ModMail] Failed to delete inbox message:`,
+          error.message
+        );
+      }
+    }
+  }, 5000);
+}
 
           const user = await client.users.fetch(
             conversation.user_id
