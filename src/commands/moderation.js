@@ -1,13 +1,14 @@
 const {
   SlashCommandBuilder,
   PermissionFlagsBits,
+  ChannelType,
 } = require("discord.js");
+
+const ADMIN = PermissionFlagsBits.Administrator;
 
 // ============================================================
 // ADMIN ONLY
 // ============================================================
-
-const ADMIN = PermissionFlagsBits.Administrator;
 
 function adminOnly(builder) {
   return builder
@@ -15,12 +16,12 @@ function adminOnly(builder) {
     .setDMPermission(false);
 }
 
-function isAdmin(i) {
-  return i.memberPermissions?.has(ADMIN);
+function isAdmin(interaction) {
+  return interaction.memberPermissions?.has(ADMIN);
 }
 
-function deny(i) {
-  return i.reply({
+async function deny(interaction) {
+  return interaction.reply({
     content:
       "❌ You need Administrator permission to use this command.",
     ephemeral: true,
@@ -43,40 +44,152 @@ function isProtectedRole(roleId) {
 }
 
 // ============================================================
-// MEMBER CHECK
+// PROTECTED MEMBER
 // ============================================================
 
-function canModerateMember(interaction, member) {
+function isProtectedMember(member) {
   if (!member) return false;
 
-  // Server owner cannot be moderated
+  // Server owner can never be moderated
+  if (member.id === member.guild.ownerId) {
+    return true;
+  }
+
+  // Protected roles
+  return member.roles.cache.some((role) =>
+    isProtectedRole(role.id)
+  );
+}
+
+// ============================================================
+// BOT HIERARCHY
+// ============================================================
+
+function botMember(interaction) {
+  return interaction.guild.members.me;
+}
+
+function canModerate(interaction, member) {
+  const bot = botMember(interaction);
+
+  if (!bot) {
+    return {
+      ok: false,
+      message:
+        "❌ I could not find my server member information.",
+    };
+  }
+
   if (member.id === interaction.guild.ownerId) {
-    return false;
+    return {
+      ok: false,
+      message:
+        "❌ I cannot moderate the server owner.",
+    };
   }
 
-  // Protected roles cannot be moderated
-  const protectedIds = getProtectedRoleIds();
-
-  if (
-    member.roles.cache.some((role) =>
-      protectedIds.includes(role.id)
-    )
-  ) {
-    return false;
+  if (member.id === bot.id) {
+    return {
+      ok: false,
+      message:
+        "❌ I cannot moderate myself.",
+    };
   }
 
-  // Bot role hierarchy check
-  const botMember = interaction.guild.members.me;
-
   if (
-    botMember &&
     member.roles.highest.position >=
-      botMember.roles.highest.position
+    bot.roles.highest.position
   ) {
-    return false;
+    return {
+      ok: false,
+      message:
+        "❌ I cannot moderate this member because their highest role is equal to or higher than my highest role.",
+    };
   }
 
-  return true;
+  if (isProtectedMember(member)) {
+    return {
+      ok: false,
+      message:
+        "❌ This member is protected and cannot be moderated.",
+    };
+  }
+
+  return {
+    ok: true,
+  };
+}
+
+// ============================================================
+// FETCH MEMBER
+// ============================================================
+
+async function getMember(interaction, user) {
+  return interaction.guild.members
+    .fetch(user.id)
+    .catch(() => null);
+}
+
+// ============================================================
+// LOG
+// ============================================================
+
+async function safeLog(
+  logAction,
+  guild,
+  title,
+  description,
+  color
+) {
+  if (typeof logAction !== "function") return;
+
+  await logAction(
+    guild,
+    title,
+    description,
+    color
+  ).catch(() => {});
+}
+
+// ============================================================
+// CASE DATABASE
+// ============================================================
+
+async function createCase(
+  db,
+  interaction,
+  target,
+  action,
+  reason,
+  durationSeconds = null
+) {
+  if (typeof db !== "function") return;
+
+  await db(
+    `INSERT INTO moderation_cases
+     (
+       guild_id,
+       user_id,
+       moderator_id,
+       action,
+       reason,
+       duration_seconds
+     )
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [
+      interaction.guild.id,
+      target.id,
+      interaction.user.id,
+      action,
+      reason || null,
+      durationSeconds,
+    ]
+  ).catch((error) => {
+    console.error(
+      "❌ Failed to create moderation case:",
+      error
+    );
+  });
 }
 
 // ============================================================
@@ -97,14 +210,15 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member to warn")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
-            .setDescription("Reason")
+            .setDescription("Reason for the warning")
             .setRequired(true)
+            .setMaxLength(500)
         )
     ),
 
@@ -112,44 +226,59 @@ module.exports = [
       if (!isAdmin(i)) return deny(i);
 
       const user = i.options.getUser("user");
-      const reason = i.options.getString("reason");
+      const reason =
+        i.options.getString("reason");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const member =
+        await getMember(i, user);
 
-      if (!canModerateMember(i, member)) {
+      if (!member) {
         return i.reply({
-          content:
-            "❌ I cannot moderate this member. They may be protected or higher than my role.",
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
           ephemeral: true,
         });
       }
 
       await db(
-        `INSERT INTO users(guild_id,user_id,warnings)
+        `INSERT INTO users
+         (guild_id,user_id,warnings)
          VALUES($1,$2,1)
-         ON CONFLICT(guild_id,user_id)
-         DO UPDATE SET warnings=users.warnings+1`,
-        [i.guild.id, member.id]
+         ON CONFLICT (guild_id,user_id)
+         DO UPDATE SET warnings = users.warnings + 1`,
+        [
+          i.guild.id,
+          user.id,
+        ]
       );
 
-      await db(
-        `INSERT INTO moderation_cases
-         (guild_id,user_id,moderator_id,action,reason)
-         VALUES($1,$2,$3,'warn',$4)`,
-        [i.guild.id, member.id, i.user.id, reason]
+      await createCase(
+        db,
+        i,
+        user,
+        "warn",
+        reason
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "⚠️ Warning",
-        `${member} was warned by ${i.user}.\nReason: ${reason}`,
-        0xFEE75C
+        "⚠️ Member warned",
+        `${user} was warned by ${i.user}.\n**Reason:** ${reason}`,
+        0xfee75c
       );
 
       await i.reply(
-        `⚠️ ${member.user.tag} has been warned.`
+        `⚠️ **${user.tag}** has been warned.\n**Reason:** ${reason}`
       );
     },
   },
@@ -162,11 +291,11 @@ module.exports = [
     data: adminOnly(
       new SlashCommandBuilder()
         .setName("warnings")
-        .setDescription("View a member's warning history.")
+        .setDescription("View a member's warnings.")
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member")
             .setRequired(true)
         )
     ),
@@ -174,42 +303,27 @@ module.exports = [
     async execute(i, { db }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
+      const user =
+        i.options.getUser("user");
 
-      const result = await db(
-        `SELECT id, reason, moderator_id, created_at
-         FROM moderation_cases
-         WHERE guild_id=$1
-         AND user_id=$2
-         AND action='warn'
-         ORDER BY created_at DESC
-         LIMIT 20`,
-        [i.guild.id, user.id]
+      const result =
+        await db(
+          `SELECT warnings
+           FROM users
+           WHERE guild_id=$1
+           AND user_id=$2`,
+          [
+            i.guild.id,
+            user.id,
+          ]
+        );
+
+      const warnings =
+        result.rows[0]?.warnings || 0;
+
+      return i.reply(
+        `⚠️ **${user.tag}** has **${warnings}** warning(s).`
       );
-
-      if (!result.rows.length) {
-        return i.reply({
-          content: `ℹ️ ${user.tag} has no warnings.`,
-          ephemeral: true,
-        });
-      }
-
-      const text = result.rows
-        .map(
-          (row, index) =>
-            `**${index + 1}.** ${row.reason || "No reason"}\n` +
-            `Case #${row.id} • <@${row.moderator_id}> • ` +
-            `<t:${Math.floor(
-              new Date(row.created_at).getTime() / 1000
-            )}:R>`
-        )
-        .join("\n\n");
-
-      await i.reply({
-        content:
-          `⚠️ **Warnings for ${user.tag}**\n\n${text}`,
-        ephemeral: true,
-      });
     },
   },
 
@@ -221,17 +335,11 @@ module.exports = [
     data: adminOnly(
       new SlashCommandBuilder()
         .setName("unwarn")
-        .setDescription("Remove a warning.")
+        .setDescription("Remove one warning from a member.")
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
-            .setRequired(true)
-        )
-        .addIntegerOption((o) =>
-          o
-            .setName("case")
-            .setDescription("Warning case ID")
+            .setDescription("Member")
             .setRequired(true)
         )
     ),
@@ -239,42 +347,30 @@ module.exports = [
     async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const caseId = i.options.getInteger("case");
-
-      const result = await db(
-        `DELETE FROM moderation_cases
-         WHERE id=$1
-         AND guild_id=$2
-         AND user_id=$3
-         AND action='warn'
-         RETURNING id`,
-        [caseId, i.guild.id, user.id]
-      );
-
-      if (!result.rows.length) {
-        return i.reply({
-          content: "❌ Warning case not found.",
-          ephemeral: true,
-        });
-      }
+      const user =
+        i.options.getUser("user");
 
       await db(
         `UPDATE users
-         SET warnings=GREATEST(warnings-1,0)
-         WHERE guild_id=$1 AND user_id=$2`,
-        [i.guild.id, user.id]
+         SET warnings = GREATEST(warnings - 1, 0)
+         WHERE guild_id=$1
+         AND user_id=$2`,
+        [
+          i.guild.id,
+          user.id,
+        ]
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "✅ Warning removed",
-        `Warning #${caseId} was removed from ${user} by ${i.user}.`,
-        0x57F287
+        `One warning was removed from ${user} by ${i.user}.`,
+        0x57f287
       );
 
-      await i.reply(
-        `✅ Warning #${caseId} removed from ${user.tag}.`
+      return i.reply(
+        `✅ Removed one warning from **${user.tag}**.`
       );
     },
   },
@@ -291,39 +387,63 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member")
             .setRequired(true)
         )
         .addIntegerOption((o) =>
           o
             .setName("minutes")
-            .setDescription("Timeout duration")
+            .setDescription("Timeout duration in minutes")
             .setRequired(true)
             .setMinValue(1)
-            .setMaxValue(10080)
+            .setMaxValue(40320)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(true)
+            .setRequired(false)
+            .setMaxLength(500)
         )
     ),
 
     async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const minutes = i.options.getInteger("minutes");
-      const reason = i.options.getString("reason");
+      const user =
+        i.options.getUser("user");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const minutes =
+        i.options.getInteger("minutes");
 
-      if (!canModerateMember(i, member) || !member.moderatable) {
+      const reason =
+        i.options.getString("reason") ||
+        "No reason provided";
+
+      const member =
+        await getMember(i, user);
+
+      if (!member) {
         return i.reply({
-          content: "❌ I cannot timeout this member.",
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
+          ephemeral: true,
+        });
+      }
+
+      if (!member.moderatable) {
+        return i.reply({
+          content:
+            "❌ I don't have permission to timeout this member.",
           ephemeral: true,
         });
       }
@@ -333,28 +453,25 @@ module.exports = [
         reason
       );
 
-      await db(
-        `INSERT INTO moderation_cases
-         (guild_id,user_id,moderator_id,action,reason,duration_seconds)
-         VALUES($1,$2,$3,'timeout',$4,$5)`,
-        [
-          i.guild.id,
-          member.id,
-          i.user.id,
-          reason,
-          minutes * 60,
-        ]
+      await createCase(
+        db,
+        i,
+        user,
+        "timeout",
+        reason,
+        minutes * 60
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "⏳ Timeout",
-        `${member} timed out for ${minutes} minute(s).\nReason: ${reason}`,
-        0xFEE75C
+        "⏱️ Member timed out",
+        `${user} was timed out by ${i.user} for **${minutes} minute(s)**.\n**Reason:** ${reason}`,
+        0xfee75c
       );
 
-      await i.reply(
-        `⏳ ${member.user.tag} timed out for ${minutes} minute(s).`
+      return i.reply(
+        `⏱️ **${user.tag}** has been timed out for **${minutes} minute(s)**.`
       );
     },
   },
@@ -371,29 +488,38 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member")
             .setRequired(true)
-        )
-        .addStringOption((o) =>
-          o
-            .setName("reason")
-            .setDescription("Reason")
         )
     ),
 
-    async execute(i, { logAction }) {
+    async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const reason =
-        i.options.getString("reason") ||
-        "Timeout removed";
+      const user =
+        i.options.getUser("user");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const member =
+        await getMember(i, user);
 
-      if (!canModerateMember(i, member) || !member.moderatable) {
+      if (!member) {
+        return i.reply({
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
+          ephemeral: true,
+        });
+      }
+
+      if (!member.moderatable) {
         return i.reply({
           content:
             "❌ I cannot remove this member's timeout.",
@@ -401,17 +527,29 @@ module.exports = [
         });
       }
 
-      await member.timeout(null, reason);
-
-      await logAction(
-        i.guild,
-        "✅ Timeout removed",
-        `${member} timeout was removed by ${i.user}.\nReason: ${reason}`,
-        0x57F287
+      await member.timeout(
+        null,
+        `Timeout removed by ${i.user.tag}`
       );
 
-      await i.reply(
-        `✅ Timeout removed from ${member.user.tag}.`
+      await createCase(
+        db,
+        i,
+        user,
+        "untimeout",
+        "Timeout removed"
+      );
+
+      await safeLog(
+        logAction,
+        i.guild,
+        "✅ Timeout removed",
+        `${user} had their timeout removed by ${i.user}.`,
+        0x57f287
+      );
+
+      return i.reply(
+        `✅ Timeout removed from **${user.tag}**.`
       );
     },
   },
@@ -428,52 +566,76 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member to kick")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(true)
+            .setRequired(false)
+            .setMaxLength(500)
         )
     ),
 
     async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const reason = i.options.getString("reason");
+      const user =
+        i.options.getUser("user");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const reason =
+        i.options.getString("reason") ||
+        "No reason provided";
 
-      if (!canModerateMember(i, member) || !member.kickable) {
+      const member =
+        await getMember(i, user);
+
+      if (!member) {
         return i.reply({
-          content: "❌ I cannot kick this member.",
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
+          ephemeral: true,
+        });
+      }
+
+      if (!member.kickable) {
+        return i.reply({
+          content:
+            "❌ I don't have permission to kick this member.",
           ephemeral: true,
         });
       }
 
       await member.kick(reason);
 
-      await db(
-        `INSERT INTO moderation_cases
-         (guild_id,user_id,moderator_id,action,reason)
-         VALUES($1,$2,$3,'kick',$4)`,
-        [i.guild.id, member.id, i.user.id, reason]
+      await createCase(
+        db,
+        i,
+        user,
+        "kick",
+        reason
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "👢 Kick",
-        `${member.user.tag} kicked by ${i.user}.\nReason: ${reason}`,
-        0xED4245
+        "👢 Member kicked",
+        `${user.tag} was kicked by ${i.user}.\n**Reason:** ${reason}`,
+        0xed4245
       );
 
-      await i.reply(
-        `👢 ${member.user.tag} was kicked.`
+      return i.reply(
+        `👢 **${user.tag}** has been kicked.`
       );
     },
   },
@@ -490,59 +652,77 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member to ban")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(true)
+            .setRequired(false)
+            .setMaxLength(500)
         )
     ),
 
     async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const reason = i.options.getString("reason");
+      const user =
+        i.options.getUser("user");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const reason =
+        i.options.getString("reason") ||
+        "No reason provided";
 
-      if (!member) {
-        return i.reply({
-          content: "❌ Member not found.",
-          ephemeral: true,
-        });
+      const member =
+        await getMember(i, user);
+
+      if (member) {
+        const check =
+          canModerate(i, member);
+
+        if (!check.ok) {
+          return i.reply({
+            content: check.message,
+            ephemeral: true,
+          });
+        }
+
+        if (!member.bannable) {
+          return i.reply({
+            content:
+              "❌ I don't have permission to ban this member.",
+            ephemeral: true,
+          });
+        }
       }
 
-      if (!canModerateMember(i, member) || !member.bannable) {
-        return i.reply({
-          content: "❌ I cannot ban this member.",
-          ephemeral: true,
-        });
-      }
-
-      await member.ban({ reason });
-
-      await db(
-        `INSERT INTO moderation_cases
-         (guild_id,user_id,moderator_id,action,reason)
-         VALUES($1,$2,$3,'ban',$4)`,
-        [i.guild.id, member.id, i.user.id, reason]
+      await i.guild.members.ban(
+        user.id,
+        {
+          reason,
+          deleteMessageSeconds: 0,
+        }
       );
 
-      await logAction(
+      await createCase(
+        db,
+        i,
+        user,
+        "ban",
+        reason
+      );
+
+      await safeLog(
+        logAction,
         i.guild,
-        "🔨 Ban",
-        `${member.user.tag} banned by ${i.user}.\nReason: ${reason}`,
-        0xED4245
+        "🔨 Member banned",
+        `${user.tag} was banned by ${i.user}.\n**Reason:** ${reason}`,
+        0xed4245
       );
 
-      await i.reply(
-        `🔨 ${member.user.tag} was banned.`
+      return i.reply(
+        `🔨 **${user.tag}** has been banned.`
       );
     },
   },
@@ -558,49 +738,67 @@ module.exports = [
         .setDescription("Unban a user.")
         .addStringOption((o) =>
           o
-            .setName("userid")
-            .setDescription("Discord User ID")
+            .setName("user_id")
+            .setDescription("User ID")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
             .setDescription("Reason")
+            .setRequired(false)
         )
     ),
 
-    async execute(i, { logAction }) {
+    async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
       const userId =
-        i.options.getString("userid");
+        i.options.getString("user_id");
 
       const reason =
         i.options.getString("reason") ||
-        "Unbanned by administrator";
+        "No reason provided";
+
+      if (!/^\d{17,20}$/.test(userId)) {
+        return i.reply({
+          content:
+            "❌ Invalid Discord user ID.",
+          ephemeral: true,
+        });
+      }
 
       try {
         await i.guild.members.unban(
           userId,
           reason
         );
-      } catch {
+      } catch (error) {
         return i.reply({
           content:
-            "❌ User is not banned or the ID is invalid.",
+            "❌ User is not banned or could not be unbanned.",
           ephemeral: true,
         });
       }
 
-      await logAction(
-        i.guild,
-        "✅ Unban",
-        `<@${userId}> was unbanned by ${i.user}.\nReason: ${reason}`,
-        0x57F287
+      await createCase(
+        db,
+        i,
+        { id: userId },
+        "unban",
+        reason
       );
 
-      await i.reply(
-        `✅ User **${userId}** has been unbanned.`
+      await safeLog(
+        logAction,
+        i.guild,
+        "🔓 User unbanned",
+        `User ID **${userId}** was unbanned by ${i.user}.\n**Reason:** ${reason}`,
+        0x57f287
+      );
+
+      return i.reply(
+        `🔓 User **${userId}** has been unbanned.`
       );
     },
   },
@@ -617,61 +815,86 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(true)
+            .setRequired(false)
         )
     ),
 
     async execute(i, { db, logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const reason = i.options.getString("reason");
+      const user =
+        i.options.getUser("user");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const reason =
+        i.options.getString("reason") ||
+        "No reason provided";
 
-      if (!canModerateMember(i, member) || !member.bannable) {
+      const member =
+        await getMember(i, user);
+
+      if (!member) {
         return i.reply({
-          content:
-            "❌ I cannot softban this member.",
+          content: "❌ Member not found.",
           ephemeral: true,
         });
       }
 
-      await member.ban({
-        deleteMessageSeconds: 604800,
-        reason,
-      });
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
+          ephemeral: true,
+        });
+      }
+
+      if (!member.bannable) {
+        return i.reply({
+          content:
+            "❌ I cannot ban this member.",
+          ephemeral: true,
+        });
+      }
+
+      await i.guild.members.ban(
+        user.id,
+        {
+          reason,
+          deleteMessageSeconds: 3600,
+        }
+      );
 
       await i.guild.members.unban(
         user.id,
-        "Softban completed"
+        "Softban"
       );
 
-      await db(
-        `INSERT INTO moderation_cases
-         (guild_id,user_id,moderator_id,action,reason)
-         VALUES($1,$2,$3,'softban',$4)`,
-        [i.guild.id, user.id, i.user.id, reason]
+      await createCase(
+        db,
+        i,
+        user,
+        "softban",
+        reason
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "🔨 Softban",
-        `${user.tag} softbanned by ${i.user}.\nReason: ${reason}`,
-        0xED4245
+        "🧹 Softban",
+        `${user.tag} was softbanned by ${i.user}.\n**Reason:** ${reason}`,
+        0xed4245
       );
 
-      await i.reply(
-        `🔨 ${user.tag} was softbanned.`
+      return i.reply(
+        `🧹 **${user.tag}** has been softbanned.`
       );
     },
   },
@@ -688,7 +911,7 @@ module.exports = [
         .addIntegerOption((o) =>
           o
             .setName("amount")
-            .setDescription("1-100")
+            .setDescription("Number of messages")
             .setRequired(true)
             .setMinValue(1)
             .setMaxValue(100)
@@ -698,20 +921,20 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const amount =
-        i.options.getInteger("amount");
-
       if (
         !i.channel ||
         !i.channel.isTextBased() ||
-        !i.channel.bulkDelete
+        !("bulkDelete" in i.channel)
       ) {
         return i.reply({
           content:
-            "❌ This command is not supported here.",
+            "❌ This command cannot be used here.",
           ephemeral: true,
         });
       }
+
+      const amount =
+        i.options.getInteger("amount");
 
       await i.deferReply({
         ephemeral: true,
@@ -723,14 +946,16 @@ module.exports = [
           true
         );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "🧹 Messages cleared",
-        `${i.user} deleted ${deleted.size} message(s) in ${i.channel}.`
+        `${i.user} deleted **${deleted.size}** message(s) in ${i.channel}.`,
+        0x5865f2
       );
 
-      await i.editReply(
-        `🧹 Deleted ${deleted.size} message(s).`
+      return i.editReply(
+        `🧹 Deleted **${deleted.size}** message(s).`
       );
     },
   },
@@ -743,39 +968,36 @@ module.exports = [
     data: adminOnly(
       new SlashCommandBuilder()
         .setName("purge")
-        .setDescription("Delete recent messages from a user.")
-        .addUserOption((o) =>
-          o
-            .setName("user")
-            .setDescription("Target user")
-            .setRequired(true)
-        )
+        .setDescription("Delete messages.")
         .addIntegerOption((o) =>
           o
             .setName("amount")
-            .setDescription("Messages to check")
+            .setDescription("Number of messages")
             .setRequired(true)
             .setMinValue(1)
             .setMaxValue(100)
         )
     ),
 
-    async execute(i, { logAction }) {
+    async execute(i, context) {
+      const command =
+        context?.client?.commands?.get(
+          "clear"
+        );
+
       if (!isAdmin(i)) return deny(i);
 
       if (
         !i.channel ||
-        !i.channel.isTextBased()
+        !i.channel.isTextBased() ||
+        !("bulkDelete" in i.channel)
       ) {
         return i.reply({
           content:
-            "❌ This command is not supported here.",
+            "❌ This command cannot be used here.",
           ephemeral: true,
         });
       }
-
-      const user =
-        i.options.getUser("user");
 
       const amount =
         i.options.getInteger("amount");
@@ -784,39 +1006,14 @@ module.exports = [
         ephemeral: true,
       });
 
-      const messages =
-        await i.channel.messages.fetch({
-          limit: 100,
-        });
-
-      const targets = messages
-        .filter(
-          (message) =>
-            message.author.id === user.id
-        )
-        .first(amount);
-
-      if (!targets.length) {
-        return i.editReply(
-          `ℹ️ No recent messages from ${user.tag} found.`
+      const deleted =
+        await i.channel.bulkDelete(
+          amount,
+          true
         );
-      }
 
-      let deleted = 0;
-
-      for (const message of targets) {
-        await message.delete().catch(() => {});
-        deleted++;
-      }
-
-      await logAction(
-        i.guild,
-        "🧹 User purge",
-        `${i.user} deleted ${deleted} message(s) from ${user} in ${i.channel}.`
-      );
-
-      await i.editReply(
-        `🧹 Deleted ${deleted} message(s) from ${user.tag}.`
+      return i.editReply(
+        `🧹 Purged **${deleted.size}** message(s).`
       );
     },
   },
@@ -835,35 +1032,39 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
+      const channel = i.channel;
+
       if (
-        !i.channel ||
-        !i.channel.permissionOverwrites
+        !channel ||
+        !channel.isTextBased()
       ) {
         return i.reply({
-          content: "❌ Cannot lock this channel.",
+          content:
+            "❌ This command cannot be used here.",
           ephemeral: true,
         });
       }
 
-      await i.channel.permissionOverwrites.edit(
-        i.guild.roles.everyone,
+      const everyone =
+        i.guild.roles.everyone;
+
+      await channel.permissionOverwrites.edit(
+        everyone,
         {
           SendMessages: false,
-        },
-        {
-          reason:
-            `Channel locked by ${i.user.tag}`,
         }
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "🔒 Channel locked",
-        `${i.channel} was locked by ${i.user}.`
+        `${channel} was locked by ${i.user}.`,
+        0xed4245
       );
 
-      await i.reply(
-        "🔒 This channel has been locked."
+      return i.reply(
+        "🔒 Channel locked."
       );
     },
   },
@@ -882,35 +1083,39 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
+      const channel = i.channel;
+
       if (
-        !i.channel ||
-        !i.channel.permissionOverwrites
+        !channel ||
+        !channel.isTextBased()
       ) {
         return i.reply({
-          content: "❌ Cannot unlock this channel.",
+          content:
+            "❌ This command cannot be used here.",
           ephemeral: true,
         });
       }
 
-      await i.channel.permissionOverwrites.edit(
-        i.guild.roles.everyone,
+      const everyone =
+        i.guild.roles.everyone;
+
+      await channel.permissionOverwrites.edit(
+        everyone,
         {
           SendMessages: null,
-        },
-        {
-          reason:
-            `Channel unlocked by ${i.user.tag}`,
         }
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "🔓 Channel unlocked",
-        `${i.channel} was unlocked by ${i.user}.`
+        `${channel} was unlocked by ${i.user}.`,
+        0x57f287
       );
 
-      await i.reply(
-        "🔓 This channel has been unlocked."
+      return i.reply(
+        "🔓 Channel unlocked."
       );
     },
   },
@@ -927,7 +1132,7 @@ module.exports = [
         .addIntegerOption((o) =>
           o
             .setName("seconds")
-            .setDescription("0-21600 seconds")
+            .setDescription("Slowmode seconds")
             .setRequired(true)
             .setMinValue(0)
             .setMaxValue(21600)
@@ -937,13 +1142,16 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
+      const channel = i.channel;
+
       if (
-        !i.channel ||
-        !("setRateLimitPerUser" in i.channel)
+        !channel ||
+        !channel.isTextBased() ||
+        !("setRateLimitPerUser" in channel)
       ) {
         return i.reply({
           content:
-            "❌ Slowmode is not supported here.",
+            "❌ Slowmode is not supported in this channel.",
           ephemeral: true,
         });
       }
@@ -951,18 +1159,20 @@ module.exports = [
       const seconds =
         i.options.getInteger("seconds");
 
-      await i.channel.setRateLimitPerUser(
+      await channel.setRateLimitPerUser(
         seconds,
         `Slowmode changed by ${i.user.tag}`
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "🐢 Slowmode",
-        `${i.user} set slowmode in ${i.channel} to ${seconds}s.`
+        "🐢 Slowmode changed",
+        `${i.user} set slowmode in ${channel} to **${seconds}s**.`,
+        0x5865f2
       );
 
-      await i.reply(
+      return i.reply(
         seconds === 0
           ? "🐢 Slowmode disabled."
           : `🐢 Slowmode set to **${seconds} seconds**.`
@@ -982,14 +1192,14 @@ module.exports = [
         .addUserOption((o) =>
           o
             .setName("user")
-            .setDescription("Target member")
+            .setDescription("Member")
             .setRequired(true)
         )
         .addStringOption((o) =>
           o
             .setName("nickname")
             .setDescription("New nickname")
-            .setRequired(true)
+            .setRequired(false)
             .setMaxLength(32)
         )
     ),
@@ -1003,14 +1213,27 @@ module.exports = [
       const nickname =
         i.options.getString("nickname");
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const member =
+        await getMember(i, user);
 
-      if (
-        !canModerateMember(i, member) ||
-        !member.manageable
-      ) {
+      if (!member) {
+        return i.reply({
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
+      const check =
+        canModerate(i, member);
+
+      if (!check.ok) {
+        return i.reply({
+          content: check.message,
+          ephemeral: true,
+        });
+      }
+
+      if (!member.manageable) {
         return i.reply({
           content:
             "❌ I cannot change this member's nickname.",
@@ -1019,18 +1242,22 @@ module.exports = [
       }
 
       await member.setNickname(
-        nickname,
+        nickname || null,
         `Nickname changed by ${i.user.tag}`
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
-        "🏷️ Nickname changed",
-        `${user} nickname changed to **${nickname}** by ${i.user}.`
+        "✏️ Nickname changed",
+        `${user} nickname was changed by ${i.user}.`,
+        0x5865f2
       );
 
-      await i.reply(
-        `🏷️ Nickname changed for ${user.tag}.`
+      return i.reply(
+        nickname
+          ? `✏️ Nickname changed to **${nickname}**.`
+          : "✏️ Nickname reset."
       );
     },
   },
@@ -1067,6 +1294,16 @@ module.exports = [
       const role =
         i.options.getRole("role");
 
+      const member =
+        await getMember(i, user);
+
+      if (!member) {
+        return i.reply({
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
       if (isProtectedRole(role.id)) {
         return i.reply({
           content:
@@ -1083,29 +1320,35 @@ module.exports = [
         });
       }
 
-      const botMember =
-        i.guild.members.me;
+      const bot =
+        botMember(i);
 
-      if (
-        botMember &&
-        role.position >=
-          botMember.roles.highest.position
-      ) {
+      if (!bot) {
         return i.reply({
           content:
-            "❌ I cannot assign a role higher than my highest role.",
+            "❌ Bot member not found.",
           ephemeral: true,
         });
       }
 
-      const member =
-        await i.guild.members
-          .fetch(user.id)
-          .catch(() => null);
-
-      if (!member) {
+      if (
+        role.position >=
+        bot.roles.highest.position
+      ) {
         return i.reply({
-          content: "❌ Member not found.",
+          content:
+            "❌ I cannot assign a role equal to or higher than my highest role.",
+          ephemeral: true,
+        });
+      }
+
+      if (
+        member.roles.highest.position >=
+        bot.roles.highest.position
+      ) {
+        return i.reply({
+          content:
+            "❌ I cannot manage this member's roles.",
           ephemeral: true,
         });
       }
@@ -1115,14 +1358,16 @@ module.exports = [
         `Role added by ${i.user.tag}`
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "➕ Role added",
-        `${role} added to ${user} by ${i.user}.`
+        `${role} added to ${user} by ${i.user}.`,
+        0x57f287
       );
 
-      await i.reply(
-        `✅ Added ${role} to ${user.tag}.`
+      return i.reply(
+        `✅ Added ${role} to **${user.tag}**.`
       );
     },
   },
@@ -1159,6 +1404,16 @@ module.exports = [
       const role =
         i.options.getRole("role");
 
+      const member =
+        await getMember(i, user);
+
+      if (!member) {
+        return i.reply({
+          content: "❌ Member not found.",
+          ephemeral: true,
+        });
+      }
+
       if (isProtectedRole(role.id)) {
         return i.reply({
           content:
@@ -1175,29 +1430,24 @@ module.exports = [
         });
       }
 
-      const botMember =
-        i.guild.members.me;
+      const bot =
+        botMember(i);
 
-      if (
-        botMember &&
-        role.position >=
-          botMember.roles.highest.position
-      ) {
+      if (!bot) {
         return i.reply({
           content:
-            "❌ I cannot remove a role higher than my highest role.",
+            "❌ Bot member not found.",
           ephemeral: true,
         });
       }
 
-      const member =
-        await i.guild.members
-          .fetch(user.id)
-          .catch(() => null);
-
-      if (!member) {
+      if (
+        role.position >=
+        bot.roles.highest.position
+      ) {
         return i.reply({
-          content: "❌ Member not found.",
+          content:
+            "❌ I cannot remove a role equal to or higher than my highest role.",
           ephemeral: true,
         });
       }
@@ -1207,14 +1457,16 @@ module.exports = [
         `Role removed by ${i.user.tag}`
       );
 
-      await logAction(
+      await safeLog(
+        logAction,
         i.guild,
         "➖ Role removed",
-        `${role} removed from ${user} by ${i.user}.`
+        `${role} removed from ${user} by ${i.user}.`,
+        0xed4245
       );
 
-      await i.reply(
-        `✅ Removed ${role} from ${user.tag}.`
+      return i.reply(
+        `✅ Removed ${role} from **${user.tag}**.`
       );
     },
   },
@@ -1257,14 +1509,15 @@ module.exports = [
       await i.channel.send({
         content: message,
 
-        // Prevent @everyone / @here / role mention abuse
+        // Prevent @everyone / @here / mass role mentions
         allowedMentions: {
           parse: [],
         },
       });
 
-      await i.reply({
-        content: "✅ Message sent.",
+      return i.reply({
+        content:
+          "✅ Message sent.",
         ephemeral: true,
       });
     },
