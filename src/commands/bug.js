@@ -4,10 +4,13 @@ const {
   PermissionFlagsBits,
 } = require("discord.js");
 
-const MANAGE_GUILD =
-  PermissionFlagsBits.ManageGuild;
+const MANAGE_GUILD = PermissionFlagsBits.ManageGuild;
 
 module.exports = [
+  // ==========================================================
+  // BUG REPORT
+  // ==========================================================
+
   {
     data: new SlashCommandBuilder()
       .setName("bug")
@@ -76,9 +79,7 @@ module.exports = [
           i.options.getString("product");
 
         const description =
-          i.options.getString(
-            "description"
-          );
+          i.options.getString("description");
 
         const platform =
           i.options.getString("platform");
@@ -92,18 +93,17 @@ module.exports = [
 
         const result = await db(
           `INSERT INTO bugs
-          (
-            guild_id,
-            reporter_id,
-            product,
-            description,
-            platform,
-            version,
-            severity
-          )
-          VALUES
-          ($1,$2,$3,$4,$5,$6,$7)
-          RETURNING id`,
+           (
+             guild_id,
+             reporter_id,
+             product,
+             description,
+             platform,
+             version,
+             severity
+           )
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           RETURNING id`,
           [
             i.guild.id,
             i.user.id,
@@ -115,8 +115,7 @@ module.exports = [
           ]
         );
 
-        const id =
-          result.rows[0].id;
+        const id = result.rows[0].id;
 
         const channel =
           process.env.BUG_CHANNEL_ID
@@ -125,9 +124,7 @@ module.exports = [
               )
             : i.channel;
 
-        if (
-          channel?.isTextBased()
-        ) {
+        if (channel?.isTextBased()) {
           const embed =
             new EmbedBuilder()
               .setTitle(
@@ -200,6 +197,10 @@ module.exports = [
     },
   },
 
+  // ==========================================================
+  // BUG STATUS - ADMIN / MANAGE SERVER ONLY
+  // ==========================================================
+
   {
     data: new SlashCommandBuilder()
       .setName("bug-status")
@@ -249,6 +250,7 @@ module.exports = [
       ),
 
     async execute(i, { db }) {
+      // Runtime permission protection
       if (
         !i.memberPermissions?.has(
           MANAGE_GUILD
@@ -256,7 +258,7 @@ module.exports = [
       ) {
         return i.reply({
           content:
-            "❌ You need **Manage Server** permission.",
+            "❌ You need **Manage Server** permission to use this command.",
           ephemeral: true,
         });
       }
@@ -291,8 +293,7 @@ module.exports = [
         }
 
         const fixedChannel =
-          process.env
-            .FIXED_BUG_CHANNEL_ID
+          process.env.FIXED_BUG_CHANNEL_ID
             ? i.guild.channels.cache.get(
                 process.env.FIXED_BUG_CHANNEL_ID
               )
