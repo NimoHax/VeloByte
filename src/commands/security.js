@@ -4,27 +4,21 @@ const {
   EmbedBuilder,
 } = require("discord.js");
 
-const MANAGE_GUILD =
-  PermissionFlagsBits.ManageGuild;
+const MANAGE_GUILD = PermissionFlagsBits.ManageGuild;
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("security")
-    .setDescription(
-      "Show VeloByte security status."
-    )
-    .setDefaultMemberPermissions(
-      MANAGE_GUILD
-    )
+    .setDescription("Show VeloByte security status.")
+    .setDefaultMemberPermissions(MANAGE_GUILD)
     .setDMPermission(false),
 
-  async execute(interaction) {
+  async execute(i) {
+    // Extra runtime permission protection
     if (
-      !interaction.memberPermissions?.has(
-        MANAGE_GUILD
-      )
+      !i.memberPermissions?.has(MANAGE_GUILD)
     ) {
-      return interaction.reply({
+      return i.reply({
         content:
           "❌ You need **Manage Server** permission to use this command.",
         ephemeral: true,
@@ -61,48 +55,47 @@ module.exports = {
         ? "🟢 Configured"
         : "🔴 Not configured";
 
-    const embed =
-      new EmbedBuilder()
-        .setTitle("🛡️ VeloByte Security")
-        .setDescription(
-          "Current security and system configuration."
-        )
-        .addFields(
-          {
-            name: "Anti-Spam",
-            value: antiSpam,
-            inline: true,
-          },
-          {
-            name: "Invite Protection",
-            value: invite,
-            inline: true,
-          },
-          {
-            name: "Welcome",
-            value: welcome,
-            inline: true,
-          },
-          {
-            name: "Ticket System",
-            value: ticket,
-            inline: true,
-          },
-          {
-            name: "Bug System",
-            value: bug,
-            inline: true,
-          },
-          {
-            name: "Mod Logs",
-            value: logs,
-            inline: true,
-          }
-        )
-        .setColor(0x57f287)
-        .setTimestamp();
+    const embed = new EmbedBuilder()
+      .setTitle("🛡️ VeloByte Security")
+      .setDescription(
+        "Current security and system configuration."
+      )
+      .addFields(
+        {
+          name: "Anti-Spam",
+          value: antiSpam,
+          inline: true,
+        },
+        {
+          name: "Invite Protection",
+          value: invite,
+          inline: true,
+        },
+        {
+          name: "Welcome",
+          value: welcome,
+          inline: true,
+        },
+        {
+          name: "Ticket System",
+          value: ticket,
+          inline: true,
+        },
+        {
+          name: "Bug System",
+          value: bug,
+          inline: true,
+        },
+        {
+          name: "Mod Logs",
+          value: logs,
+          inline: true,
+        }
+      )
+      .setColor(0x57f287)
+      .setTimestamp();
 
-    return interaction.reply({
+    return i.reply({
       embeds: [embed],
     });
   },
