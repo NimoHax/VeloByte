@@ -966,7 +966,7 @@ client.on(
             ]
           });
 
-          const thread = await guild.channels.fetch(threadId).catch(() => null);
+         const thread = await client.channels.fetch(threadId).catch(() => null);
 
 if (thread?.isThread()) {
   await thread.send(
