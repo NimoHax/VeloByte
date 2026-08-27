@@ -12,6 +12,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   Events,
+  REST,
+  Routes,
 } = require("discord.js");
 
 const { Pool } = require("pg");
@@ -24,6 +26,16 @@ const fs = require("fs");
 
 if (!process.env.DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN is missing.");
+  process.exit(1);
+}
+
+if (!process.env.DISCORD_CLIENT_ID) {
+  console.error("❌ DISCORD_CLIENT_ID is missing.");
+  process.exit(1);
+}
+
+if (!process.env.DISCORD_GUILD_ID) {
+  console.error("❌ DISCORD_GUILD_ID is missing.");
   process.exit(1);
 }
 
@@ -83,9 +95,11 @@ const commandFiles = fs
   .readdirSync(commandsPath)
   .filter((file) => file.endsWith(".js"));
 
+const commandData = [];
+
 console.log("");
 console.log("======================================");
-console.log("       VeloByte Command Loader");
+console.log("       VELOBYTE COMMAND LOADER");
 console.log("======================================");
 console.log("");
 
@@ -96,81 +110,59 @@ for (const file of commandFiles) {
   );
 
   try {
-    // Clear require cache
     delete require.cache[
       require.resolve(filePath)
     ];
 
     const loaded = require(filePath);
 
-    // Supports both:
-    //
-    // module.exports = {
-    //   data,
-    //   execute
-    // }
-    //
-    // AND:
-    //
-    // module.exports = [
-    //   command1,
-    //   command2
-    // ]
+    // Supports:
+    // module.exports = command
+    // module.exports = [command1, command2, ...]
 
-    const commandList = Array.isArray(
-      loaded
-    )
+    const list = Array.isArray(loaded)
       ? loaded
       : [loaded];
 
-    for (const command of commandList) {
+    for (const command of list) {
       if (
         !command ||
         !command.data ||
         typeof command.execute !== "function"
       ) {
-        console.warn(
-          `⚠️ Skipping ${file}: invalid command structure.`
+        console.error(
+          `❌ Invalid command export in ${file}`
         );
-
         continue;
       }
 
-      const commandName =
-        command.data.name;
+      const name = command.data.name;
 
-      if (!commandName) {
-        console.warn(
-          `⚠️ Skipping ${file}: command name missing.`
+      if (!name) {
+        console.error(
+          `❌ Command name missing in ${file}`
         );
-
         continue;
       }
 
-      // Prevent duplicate commands
-      if (
-        client.commands.has(
-          commandName
-        )
-      ) {
+      if (client.commands.has(name)) {
         console.error(
-          `❌ Duplicate command detected: /${commandName}`
+          `❌ Duplicate command detected: /${name}`
         );
-
-        console.error(
-          `   File: ${file}`
-        );
-
         process.exit(1);
       }
 
       client.commands.set(
-        commandName,
+        name,
         command
       );
 
+      commandData.push(
+        command.data.toJSON()
+      );
+
       console.log(
-        `✅ Loaded /${commandName} ← ${file}`
+        `✅ Loaded /${name} ← ${file}`
       );
     }
   } catch (error) {
@@ -180,7 +172,6 @@ for (const file of commandFiles) {
     );
     console.error(error);
     console.error("");
-
     process.exit(1);
   }
 }
@@ -189,9 +180,6 @@ console.log("");
 console.log(
   `📦 Total commands loaded: ${client.commands.size}`
 );
-console.log("");
-
-console.log("======================================");
 console.log("");
 
 // ============================================================
@@ -223,9 +211,7 @@ async function logAction(
       process.env.MOD_LOG_CHANNEL_ID ||
       process.env.LOG_CHANNEL_ID;
 
-    if (!channelId) {
-      return;
-    }
+    if (!channelId) return;
 
     const channel =
       guild.channels.cache.get(
@@ -255,6 +241,69 @@ async function logAction(
       "❌ Moderation log error:",
       error
     );
+  }
+}
+
+// ============================================================
+// REGISTER SLASH COMMANDS AUTOMATICALLY
+// ============================================================
+
+async function registerCommands() {
+  try {
+    console.log("");
+    console.log(
+      "🔄 Registering Discord slash commands..."
+    );
+
+    const rest = new REST({
+      version: "10",
+    }).setToken(
+      process.env.DISCORD_TOKEN
+    );
+
+    const registered =
+      await rest.put(
+        Routes.applicationGuildCommands(
+          process.env.DISCORD_CLIENT_ID,
+          process.env.DISCORD_GUILD_ID
+        ),
+        {
+          body: commandData,
+        }
+      );
+
+    console.log(
+      `✅ Successfully registered ${registered.length} commands.`
+    );
+
+    console.log("");
+    console.log(
+      "========== REGISTERED COMMANDS =========="
+    );
+
+    for (const command of registered) {
+      const adminOnly =
+        command.default_member_permissions ===
+        "8";
+
+      console.log(
+        adminOnly
+          ? `🔐 /${command.name} [ADMIN ONLY]`
+          : `✅ /${command.name}`
+      );
+    }
+
+    console.log(
+      "=========================================="
+    );
+    console.log("");
+  } catch (error) {
+    console.error("");
+    console.error(
+      "❌ Slash command registration failed."
+    );
+    console.error(error);
+    console.error("");
   }
 }
 
@@ -381,12 +430,14 @@ client.once(
 
     try {
       await initializeDatabase();
+
+      // Automatically update slash commands
+      await registerCommands();
     } catch (error) {
       console.error(
-        "❌ Database initialization failed:"
+        "❌ Startup error:",
+        error
       );
-
-      console.error(error);
     }
   }
 );
@@ -414,25 +465,18 @@ client.on(
 
         if (!command) {
           console.error(
-            `❌ Command received but not loaded: /${interaction.commandName}`
+            `❌ Command not loaded: /${interaction.commandName}`
           );
 
-          if (
-            !interaction.replied &&
-            !interaction.deferred
-          ) {
-            await interaction.reply({
-              content:
-                "❌ This command is not loaded by the bot.",
-              ephemeral: true,
-            });
-          }
-
-          return;
+          return interaction.reply({
+            content:
+              "❌ This command is not loaded by the bot.",
+            ephemeral: true,
+          });
         }
 
         console.log(
-          `⚡ /${interaction.commandName} used by ${interaction.user.tag}`
+          `⚡ /${interaction.commandName} → ${interaction.user.tag}`
         );
 
         try {
@@ -447,12 +491,12 @@ client.on(
         } catch (error) {
           console.error("");
           console.error(
-            `❌ ERROR executing /${interaction.commandName}`
+            `❌ Error executing /${interaction.commandName}`
           );
           console.error(error);
           console.error("");
 
-          const errorMessage =
+          const message =
             "❌ Something went wrong while executing this command. Check the bot logs.";
 
           if (
@@ -461,14 +505,14 @@ client.on(
           ) {
             await interaction
               .followUp({
-                content: errorMessage,
+                content: message,
                 ephemeral: true,
               })
               .catch(() => {});
           } else {
             await interaction
               .reply({
-                content: errorMessage,
+                content: message,
                 ephemeral: true,
               })
               .catch(() => {});
@@ -616,7 +660,7 @@ client.on(
             process.env.TICKET_CATEGORY_ID ||
             undefined;
 
-          const channelName =
+          let channelName =
             `ticket-${interaction.user.username}`
               .toLowerCase()
               .replace(
@@ -628,12 +672,16 @@ client.on(
                 80
               );
 
+          if (!channelName) {
+            channelName =
+              `ticket-${interaction.user.id}`;
+          }
+
           const channel =
             await interaction.guild.channels.create(
               {
                 name:
-                  channelName ||
-                  `ticket-${interaction.user.id}`,
+                  channelName,
 
                 type:
                   ChannelType.GuildText,
@@ -645,7 +693,8 @@ client.on(
                   {
                     id:
                       interaction.guild
-                        .roles.everyone.id,
+                        .roles
+                        .everyone.id,
 
                     deny: [
                       PermissionsBitField
@@ -735,12 +784,10 @@ client.on(
       }
 
     } catch (error) {
-      console.error("");
       console.error(
-        "❌ Interaction handler error:"
+        "❌ Interaction handler error:",
+        error
       );
-      console.error(error);
-      console.error("");
 
       try {
         if (
@@ -818,20 +865,15 @@ client.on(
                 {
                   name:
                     "Member",
-
                   value:
                     `#${count}`,
-
                   inline: true,
                 },
-
                 {
                   name:
                     "Server",
-
                   value:
                     "VeloByte",
-
                   inline: true,
                 }
               )
@@ -866,7 +908,7 @@ client.on(
 );
 
 // ============================================================
-// ANTI-SPAM
+// ANTI-SPAM + XP
 // ============================================================
 
 const spam = new Map();
@@ -946,7 +988,7 @@ client.on(
       }
 
       // ======================================================
-      // SPAM TIMEOUT
+      // ANTI-SPAM
       // ======================================================
 
       if (
@@ -1120,6 +1162,30 @@ client.on(
 );
 
 // ============================================================
+// PROCESS ERROR HANDLERS
+// ============================================================
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+    console.error(
+      "❌ Unhandled Promise Rejection:",
+      error
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "❌ Uncaught Exception:",
+      error
+    );
+  }
+);
+
+// ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
 
@@ -1127,7 +1193,7 @@ async function shutdown(
   signal
 ) {
   console.log(
-    `\n🛑 Received ${signal}. Shutting down...`
+    `🛑 ${signal} received. Shutting down...`
   );
 
   try {
@@ -1161,12 +1227,15 @@ client
   .login(
     process.env.DISCORD_TOKEN
   )
+  .then(() => {
+    console.log(
+      "🔑 Discord login successful."
+    );
+  })
   .catch((error) => {
     console.error(
       "❌ Discord login failed:"
     );
-
     console.error(error);
-
     process.exit(1);
   });
