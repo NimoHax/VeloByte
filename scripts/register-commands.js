@@ -21,14 +21,17 @@ if (!GUILD_ID) {
   process.exit(1);
 }
 
-// ============================================================
-// FIND COMMAND FILES
-// ============================================================
-
-const commandsPath = path.join(__dirname, "..", "src", "commands");
+const commandsPath = path.join(
+  __dirname,
+  "..",
+  "src",
+  "commands"
+);
 
 if (!fs.existsSync(commandsPath)) {
-  console.error(`❌ Commands folder not found: ${commandsPath}`);
+  console.error(
+    `❌ Commands folder not found: ${commandsPath}`
+  );
   process.exit(1);
 }
 
@@ -40,7 +43,7 @@ const commands = [];
 
 console.log("");
 console.log("======================================");
-console.log("      VeloByte Command Register");
+console.log("       VeloByte Command Register");
 console.log("======================================");
 console.log("");
 
@@ -52,87 +55,78 @@ for (const file of commandFiles) {
 
     const loaded = require(filePath);
 
-    // Command file can export:
-    // 1. One command object
-    // 2. An array of command objects
     const commandList = Array.isArray(loaded)
       ? loaded
       : [loaded];
 
     for (const command of commandList) {
       if (!command || !command.data) {
-        console.warn(
-          `⚠️ Skipping ${file}: invalid command export.`
+        console.log(
+          `⚠️ Skipped ${file}: invalid command`
         );
         continue;
       }
 
-      const json = command.data.toJSON();
+      const data = command.data.toJSON();
 
-      if (!json.name) {
-        console.warn(
-          `⚠️ Skipping ${file}: command name missing.`
+      if (!data.name) {
+        console.log(
+          `⚠️ Skipped ${file}: command name missing`
         );
         continue;
       }
 
-      commands.push(json);
+      commands.push(data);
 
-      const permissions =
-        json.default_member_permissions;
+      const adminOnly =
+        data.default_member_permissions === "8";
 
-      if (
-        permissions === "8" ||
-        permissions === "Administrator"
-      ) {
-        console.log(`🔐 /${json.name} [ADMIN ONLY]`);
-      } else {
-        console.log(`✅ /${json.name}`);
-      }
+      console.log(
+        adminOnly
+          ? `🔐 /${data.name} [ADMIN ONLY]`
+          : `✅ /${data.name}`
+      );
     }
   } catch (error) {
-    console.error(
-      `❌ Failed to load ${file}:`
-    );
+    console.error("");
+    console.error(`❌ Error loading ${file}`);
     console.error(error);
+    console.error("");
   }
 }
 
 console.log("");
-console.log(`📦 Commands found: ${commands.length}`);
+console.log(`📦 Total commands: ${commands.length}`);
 console.log("");
 
 // ============================================================
 // DUPLICATE CHECK
 // ============================================================
 
-const names = new Set();
-const duplicates = [];
+const seen = new Set();
 
 for (const command of commands) {
-  if (names.has(command.name)) {
-    duplicates.push(command.name);
+  if (seen.has(command.name)) {
+    console.error(
+      `❌ Duplicate command: /${command.name}`
+    );
+    process.exit(1);
   }
 
-  names.add(command.name);
-}
-
-if (duplicates.length) {
-  console.error(
-    `❌ Duplicate commands found: ${duplicates.join(", ")}`
-  );
-  process.exit(1);
+  seen.add(command.name);
 }
 
 // ============================================================
-// REGISTER COMMANDS
+// REGISTER
 // ============================================================
 
-const rest = new REST({ version: "10" }).setToken(TOKEN);
+const rest = new REST({
+  version: "10",
+}).setToken(TOKEN);
 
 (async () => {
   try {
-    console.log("🔄 Registering guild commands...");
+    console.log("🔄 Updating Discord guild commands...");
     console.log("");
 
     const result = await rest.put(
@@ -146,30 +140,29 @@ const rest = new REST({ version: "10" }).setToken(TOKEN);
     );
 
     console.log(
-      `✅ Successfully registered ${result.length} guild commands.`
+      `✅ Successfully registered ${result.length} commands.`
     );
 
     console.log("");
-    console.log("======================================");
-    console.log("          Registration Done");
-    console.log("======================================");
-    console.log("");
-
-    console.log("Registered commands:");
+    console.log("========== REGISTERED ==========");
 
     for (const command of result) {
       const adminOnly =
         command.default_member_permissions === "8";
 
       console.log(
-        `• /${command.name}${adminOnly ? " [ADMIN ONLY]" : ""}`
+        `${adminOnly ? "🔐" : "✅"} /${command.name}`
       );
     }
 
     console.log("");
+    console.log("================================");
+    console.log("       Registration Complete");
+    console.log("================================");
+    console.log("");
   } catch (error) {
     console.error("");
-    console.error("❌ Command registration failed:");
+    console.error("❌ Discord registration failed:");
     console.error(error);
     console.error("");
     process.exit(1);
