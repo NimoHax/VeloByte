@@ -1,28 +1,28 @@
 const {
   SlashCommandBuilder,
   PermissionFlagsBits,
-  ChannelType,
 } = require("discord.js");
 
 // ============================================================
-// ADMIN ONLY MODERATION
+// ADMIN ONLY
 // ============================================================
 
 const ADMIN = PermissionFlagsBits.Administrator;
 
 function adminOnly(builder) {
   return builder
-    .setDefaultMemberPermissions(ADMIN.bitfield)
+    .setDefaultMemberPermissions(ADMIN)
     .setDMPermission(false);
 }
 
-function isAdmin(interaction) {
-  return interaction.memberPermissions?.has(ADMIN);
+function isAdmin(i) {
+  return i.memberPermissions?.has(ADMIN);
 }
 
-function deny(interaction) {
-  return interaction.reply({
-    content: "❌ You need Administrator permission to use this command.",
+function deny(i) {
+  return i.reply({
+    content:
+      "❌ You need Administrator permission to use this command.",
     ephemeral: true,
   });
 }
@@ -43,14 +43,16 @@ function isProtectedRole(roleId) {
 }
 
 // ============================================================
-// TARGET CHECK
+// MEMBER CHECK
 // ============================================================
 
 function canModerateMember(interaction, member) {
   if (!member) return false;
 
   // Server owner cannot be moderated
-  if (member.id === interaction.guild.ownerId) return false;
+  if (member.id === interaction.guild.ownerId) {
+    return false;
+  }
 
   // Protected roles cannot be moderated
   const protectedIds = getProtectedRoleIds();
@@ -63,11 +65,13 @@ function canModerateMember(interaction, member) {
     return false;
   }
 
-  // Bot must be above target
+  // Bot role hierarchy check
+  const botMember = interaction.guild.members.me;
+
   if (
-    interaction.guild.members.me &&
+    botMember &&
     member.roles.highest.position >=
-      interaction.guild.members.me.roles.highest.position
+      botMember.roles.highest.position
   ) {
     return false;
   }
@@ -76,7 +80,7 @@ function canModerateMember(interaction, member) {
 }
 
 // ============================================================
-// MODULE
+// COMMANDS
 // ============================================================
 
 module.exports = [
@@ -184,9 +188,10 @@ module.exports = [
       );
 
       if (!result.rows.length) {
-        return i.reply(
-          `ℹ️ ${user.tag} has no warnings.`
-        );
+        return i.reply({
+          content: `ℹ️ ${user.tag} has no warnings.`,
+          ephemeral: true,
+        });
       }
 
       const text = result.rows
@@ -194,12 +199,15 @@ module.exports = [
           (row, index) =>
             `**${index + 1}.** ${row.reason || "No reason"}\n` +
             `Case #${row.id} • <@${row.moderator_id}> • ` +
-            `<t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`
+            `<t:${Math.floor(
+              new Date(row.created_at).getTime() / 1000
+            )}:R>`
         )
         .join("\n\n");
 
       await i.reply({
-        content: `⚠️ **Warnings for ${user.tag}**\n\n${text}`,
+        content:
+          `⚠️ **Warnings for ${user.tag}**\n\n${text}`,
         ephemeral: true,
       });
     },
@@ -213,7 +221,7 @@ module.exports = [
     data: adminOnly(
       new SlashCommandBuilder()
         .setName("unwarn")
-        .setDescription("Remove a warning from a member.")
+        .setDescription("Remove a warning.")
         .addUserOption((o) =>
           o
             .setName("user")
@@ -289,7 +297,7 @@ module.exports = [
         .addIntegerOption((o) =>
           o
             .setName("minutes")
-            .setDescription("Timeout duration in minutes")
+            .setDescription("Timeout duration")
             .setRequired(true)
             .setMinValue(1)
             .setMaxValue(10080)
@@ -370,7 +378,6 @@ module.exports = [
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(false)
         )
     ),
 
@@ -379,7 +386,8 @@ module.exports = [
 
       const user = i.options.getUser("user");
       const reason =
-        i.options.getString("reason") || "Timeout removed";
+        i.options.getString("reason") ||
+        "Timeout removed";
 
       const member = await i.guild.members
         .fetch(user.id)
@@ -387,7 +395,8 @@ module.exports = [
 
       if (!canModerateMember(i, member) || !member.moderatable) {
         return i.reply({
-          content: "❌ I cannot remove this member's timeout.",
+          content:
+            "❌ I cannot remove this member's timeout.",
           ephemeral: true,
         });
       }
@@ -557,25 +566,28 @@ module.exports = [
           o
             .setName("reason")
             .setDescription("Reason")
-            .setRequired(false)
         )
     ),
 
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const userId = i.options.getString("userid");
+      const userId =
+        i.options.getString("userid");
+
       const reason =
-        i.options.getString("reason") || "Unbanned by administrator";
+        i.options.getString("reason") ||
+        "Unbanned by administrator";
 
       try {
         await i.guild.members.unban(
           userId,
           reason
         );
-      } catch (error) {
+      } catch {
         return i.reply({
-          content: "❌ User is not banned or the ID is invalid.",
+          content:
+            "❌ User is not banned or the ID is invalid.",
           ephemeral: true,
         });
       }
@@ -628,7 +640,8 @@ module.exports = [
 
       if (!canModerateMember(i, member) || !member.bannable) {
         return i.reply({
-          content: "❌ I cannot softban this member.",
+          content:
+            "❌ I cannot softban this member.",
           ephemeral: true,
         });
       }
@@ -685,7 +698,8 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const amount = i.options.getInteger("amount");
+      const amount =
+        i.options.getInteger("amount");
 
       if (
         !i.channel ||
@@ -693,7 +707,8 @@ module.exports = [
         !i.channel.bulkDelete
       ) {
         return i.reply({
-          content: "❌ This command is not supported here.",
+          content:
+            "❌ This command is not supported here.",
           ephemeral: true,
         });
       }
@@ -702,10 +717,11 @@ module.exports = [
         ephemeral: true,
       });
 
-      const deleted = await i.channel.bulkDelete(
-        amount,
-        true
-      );
+      const deleted =
+        await i.channel.bulkDelete(
+          amount,
+          true
+        );
 
       await logAction(
         i.guild,
@@ -720,14 +736,14 @@ module.exports = [
   },
 
   // ==========================================================
-  // PURGE USER
+  // PURGE
   // ==========================================================
 
   {
     data: adminOnly(
       new SlashCommandBuilder()
         .setName("purge")
-        .setDescription("Delete recent messages from a specific user.")
+        .setDescription("Delete recent messages from a user.")
         .addUserOption((o) =>
           o
             .setName("user")
@@ -737,7 +753,7 @@ module.exports = [
         .addIntegerOption((o) =>
           o
             .setName("amount")
-            .setDescription("Messages to check, 1-100")
+            .setDescription("Messages to check")
             .setRequired(true)
             .setMinValue(1)
             .setMaxValue(100)
@@ -752,26 +768,33 @@ module.exports = [
         !i.channel.isTextBased()
       ) {
         return i.reply({
-          content: "❌ This command is not supported here.",
+          content:
+            "❌ This command is not supported here.",
           ephemeral: true,
         });
       }
 
-      const user = i.options.getUser("user");
-      const amount = i.options.getInteger("amount");
+      const user =
+        i.options.getUser("user");
+
+      const amount =
+        i.options.getInteger("amount");
 
       await i.deferReply({
         ephemeral: true,
       });
 
-      const messages = await i.channel.messages.fetch({
-        limit: 100,
-      });
+      const messages =
+        await i.channel.messages.fetch({
+          limit: 100,
+        });
 
-      const targets = messages.filter(
-        (message) =>
-          message.author.id === user.id
-      ).first(amount);
+      const targets = messages
+        .filter(
+          (message) =>
+            message.author.id === user.id
+        )
+        .first(amount);
 
       if (!targets.length) {
         return i.editReply(
@@ -828,7 +851,8 @@ module.exports = [
           SendMessages: false,
         },
         {
-          reason: `Channel locked by ${i.user.tag}`,
+          reason:
+            `Channel locked by ${i.user.tag}`,
         }
       );
 
@@ -874,7 +898,8 @@ module.exports = [
           SendMessages: null,
         },
         {
-          reason: `Channel unlocked by ${i.user.tag}`,
+          reason:
+            `Channel unlocked by ${i.user.tag}`,
         }
       );
 
@@ -917,7 +942,8 @@ module.exports = [
         !("setRateLimitPerUser" in i.channel)
       ) {
         return i.reply({
-          content: "❌ Slowmode is not supported here.",
+          content:
+            "❌ Slowmode is not supported here.",
           ephemeral: true,
         });
       }
@@ -971,7 +997,8 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
+      const user =
+        i.options.getUser("user");
 
       const nickname =
         i.options.getString("nickname");
@@ -980,9 +1007,13 @@ module.exports = [
         .fetch(user.id)
         .catch(() => null);
 
-      if (!canModerateMember(i, member) || !member.manageable) {
+      if (
+        !canModerateMember(i, member) ||
+        !member.manageable
+      ) {
         return i.reply({
-          content: "❌ I cannot change this member's nickname.",
+          content:
+            "❌ I cannot change this member's nickname.",
           ephemeral: true,
         });
       }
@@ -1030,38 +1061,47 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const role = i.options.getRole("role");
+      const user =
+        i.options.getUser("user");
+
+      const role =
+        i.options.getRole("role");
 
       if (isProtectedRole(role.id)) {
         return i.reply({
-          content: "❌ This role is protected.",
+          content:
+            "❌ This role is protected.",
           ephemeral: true,
         });
       }
 
       if (role.managed) {
         return i.reply({
-          content: "❌ Managed/integration roles cannot be assigned.",
+          content:
+            "❌ Managed/integration roles cannot be assigned.",
           ephemeral: true,
         });
       }
 
-      const botMember = i.guild.members.me;
+      const botMember =
+        i.guild.members.me;
 
       if (
         botMember &&
-        role.position >= botMember.roles.highest.position
+        role.position >=
+          botMember.roles.highest.position
       ) {
         return i.reply({
-          content: "❌ I cannot assign a role higher than my highest role.",
+          content:
+            "❌ I cannot assign a role higher than my highest role.",
           ephemeral: true,
         });
       }
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const member =
+        await i.guild.members
+          .fetch(user.id)
+          .catch(() => null);
 
       if (!member) {
         return i.reply({
@@ -1113,38 +1153,47 @@ module.exports = [
     async execute(i, { logAction }) {
       if (!isAdmin(i)) return deny(i);
 
-      const user = i.options.getUser("user");
-      const role = i.options.getRole("role");
+      const user =
+        i.options.getUser("user");
+
+      const role =
+        i.options.getRole("role");
 
       if (isProtectedRole(role.id)) {
         return i.reply({
-          content: "❌ This role is protected.",
+          content:
+            "❌ This role is protected.",
           ephemeral: true,
         });
       }
 
       if (role.managed) {
         return i.reply({
-          content: "❌ Managed/integration roles cannot be removed.",
+          content:
+            "❌ Managed/integration roles cannot be removed.",
           ephemeral: true,
         });
       }
 
-      const botMember = i.guild.members.me;
+      const botMember =
+        i.guild.members.me;
 
       if (
         botMember &&
-        role.position >= botMember.roles.highest.position
+        role.position >=
+          botMember.roles.highest.position
       ) {
         return i.reply({
-          content: "❌ I cannot remove a role higher than my highest role.",
+          content:
+            "❌ I cannot remove a role higher than my highest role.",
           ephemeral: true,
         });
       }
 
-      const member = await i.guild.members
-        .fetch(user.id)
-        .catch(() => null);
+      const member =
+        await i.guild.members
+          .fetch(user.id)
+          .catch(() => null);
 
       if (!member) {
         return i.reply({
@@ -1196,7 +1245,8 @@ module.exports = [
         !i.channel.isTextBased()
       ) {
         return i.reply({
-          content: "❌ This command can only be used in a text channel.",
+          content:
+            "❌ This command can only be used in a text channel.",
           ephemeral: true,
         });
       }
@@ -1207,7 +1257,7 @@ module.exports = [
       await i.channel.send({
         content: message,
 
-        // Prevent @everyone / @here / mass role mentions
+        // Prevent @everyone / @here / role mention abuse
         allowedMentions: {
           parse: [],
         },
